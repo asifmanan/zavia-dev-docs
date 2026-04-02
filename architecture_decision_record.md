@@ -1,5 +1,5 @@
 # Zavia — Architecture Decision Records
-> Last updated: March 2026
+> Last updated: April 2026
 
 ---
 
@@ -20,10 +20,11 @@
 ---
 
 ## ADR-003: `curriculum/` as a separate app
-**Decision:** Curriculum structure (CurriculumVersion, CurriculumEntry) lives in its own `curriculum/` app, separate from `programs/` and `courses/`.
-**Reason:** Curriculum is the academic STRUCTURE — which courses belong to a program, in what order, at what year level. This is a distinct domain concern from defining programs or courses.
+**Decision:** Curriculum structure (CurriculumVersion, CurriculumLevel, CurriculumEntry) lives in its own `curriculum/` app, separate from `programs/` and `courses/`.
+**Reason:** Curriculum is the academic STRUCTURE — which courses belong to a program, in what order, at what named level. This is a distinct domain concern from defining programs or courses.
 **Alternatives considered:** Putting ProgramCourse M2M inside `programs/` app.
 **Status:** Implemented
+**See also:** ADR-026 for the `CurriculumLevel` model added to this app.
 
 ---
 
@@ -289,8 +290,8 @@ class CurriculumLevel(models.Model):
 **CurriculumEntry.curriculum_level** is a nullable FK to `CurriculumLevel` with `on_delete=SET_NULL`. Null means the entry is unassigned — not yet placed in a level. This is intentional: nullable at DB level for safety, but the UI always places courses into a level (no path to create an unassigned entry through normal workflow).
 **Naming:** Fully flexible free text. No enum, no pattern enforcement. The UI provides placeholder guidance ("e.g. Level 1, Semester 1, Foundation Year") without constraining the admin's choice.
 **No default level auto-created:** Programs start with zero levels. The admin builds the structure organically in the curriculum builder — creating levels first, then adding courses into them. This matches how academics actually plan curriculum rather than forcing upfront structural decisions.
-**Ordering:** Levels have an explicit `order` field managed via a dedicated reorder endpoint
-(`POST .../levels/reorder/`). Order is independent of name — "Foundation Year" can be first without its name encoding that.
+**Ordering:** Levels have an explicit `order` field managed via a dedicated reorder endpoint (`POST .../levels/reorder/`). Order is independent of name — "Foundation Year" can be first without its name encoding that. On creation, `order` is set to `max(order) + 1` among active levels for that version (not a count), so soft-delete gaps do not corrupt the position of newly created levels.
+**Queryset ordering note:** `Meta.ordering = ['order', 'created_at']` is defined on the model, but Django's `.annotate()` (used to compute `entry_count`) strips `Meta.ordering`. The list view therefore applies an explicit `.order_by('order', 'created_at')` on the queryset.
 **Supersedes:** The integer `level` field on `CurriculumEntry` (removed in migration `curriculum/0003`).
 **Alternatives considered:**
 - Integer level field — rejected: implicit, no naming flexibility

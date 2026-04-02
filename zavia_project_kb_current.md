@@ -1,5 +1,5 @@
 # Zavia (zavia.app) – Project Knowledge Base
-> Last updated: March 2026
+> Last updated: April 2026
 
 ---
 
@@ -125,7 +125,8 @@ Every tenant is an **Organization**. All domain data is scoped to it.
 /o/{orgSlug}/courses
 /o/{orgSlug}/programs
 /o/{orgSlug}/programs/:id
-/o/{orgSlug}/programs/:id/curriculum
+/o/{orgSlug}/programs/:id/curriculum              ← redirects to default/first version
+/o/{orgSlug}/programs/:id/curriculum/:versionId   ← curriculum builder for a specific version
 /o/{orgSlug}/programs/:id/terms
 /o/{orgSlug}/enrollments
 /o/{orgSlug}/admin/users
@@ -344,38 +345,66 @@ On program creation, a default `CurriculumVersion` is auto-created via use case.
 ---
 
 ### `curriculum/`
-Defines the academic structure of a program — which courses belong to it, in what order and year level. Separate from program/course definitions.
+Defines the academic structure of a program — which courses belong to it, in what order and at what named level. Separate from program/course definitions.
 
 **`CurriculumVersion` model**
 ```
 - id            UUID, PK
 - organization  FK → Organization
 - program       FK → Program
-- name          CharField (e.g. "Default Curriculum", "2024 Revision")
+- name          CharField (e.g. "Version 1", "2024 Revision")
 - is_default    BooleanField
 - is_active     BooleanField, default=True
 - created_at    auto
 - updated_at    auto
 ```
 
-Only one version can be default per program. Default version is auto-created with the program. Non-default versions can be deleted; default cannot.
+Only one version can be default per program (partial unique index). Default version is auto-created when a program is created. Non-default versions can be soft-deleted; the default cannot.
 
-**`CurriculumEntry` model**
+Constraints:
+- `UniqueConstraint(program, condition=is_default=True AND is_active=True)` — one default per program
+- Case-insensitive name uniqueness enforced in use case (`iexact`) before save
+
+**`CurriculumLevel` model**
 ```
 - id            UUID, PK
 - organization  FK → Organization
 - version       FK → CurriculumVersion
-- course        FK → Course
-- year_level    PositiveIntegerField, optional (1, 2, 3…)
-- order         PositiveIntegerField, optional
-- is_core       BooleanField, default=True
+- name          CharField, free text (e.g. "Year 1", "Foundation", "Clinical Year")
+- order         PositiveIntegerField
+- entry_count   annotated read-only (count of active entries in this level)
 - is_active     BooleanField, default=True
 - created_at    auto
 - updated_at    auto
 ```
 
 Constraints:
-- `UniqueConstraint(version, course)`
+- `UniqueConstraint(version, name, condition=is_active=True)` — unique name per version (active only)
+- Case-insensitive name uniqueness enforced in use case (`iexact`) before save
+
+Ordering: `order` field is set to `max(order) + 1` on creation (handles soft-delete gaps). Managed explicitly via `POST .../levels/reorder/`. `Meta.ordering = ['order', 'created_at']` is defined on the model but `.annotate()` in the list view queryset strips it — the view adds an explicit `.order_by('order', 'created_at')` to compensate.
+
+Programs start with zero levels. The admin creates levels first, then adds courses into them.
+
+**`CurriculumEntry` model**
+```
+- id                UUID, PK
+- organization      FK → Organization
+- version           FK → CurriculumVersion
+- course            FK → Course (PROTECT)
+- curriculum_level  FK → CurriculumLevel (SET_NULL, nullable)
+- level_name        denormalised read-only (from serializer)
+- order             PositiveIntegerField, optional
+- is_core           BooleanField, default=True
+- is_active         BooleanField, default=True
+- created_at        auto
+- updated_at        auto
+```
+
+Constraints:
+- `UniqueConstraint(version, course, condition=is_active=True)` — one course per version
+
+`curriculum_level` is nullable. Null means the entry is unassigned — this only occurs when a level is soft-deleted (`SET_NULL`). There is no UI path to create an unassigned entry in normal workflow. The curriculum builder shows an Unassigned section as a recovery mechanism for entries orphaned by level deletion.
 
 ---
 
@@ -440,7 +469,9 @@ Organization
   ├── Department
   │     ├── Program
   │     │     ├── CurriculumVersion
-  │     │     │     └── CurriculumEntry ──→ Course (owned by a dept, borrowed here)
+  │     │     │     ├── CurriculumLevel (named, ordered)
+  │     │     │     │     └── CurriculumEntry ──→ Course (owned by a dept, borrowed here)
+  │     │     │     └── CurriculumEntry (unassigned — curriculum_level=null)
   │     │     └── AcademicTerm ──→ CurriculumVersion
   │     └── Course (owned by this department)
   └── Student
@@ -526,6 +557,13 @@ PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/
 DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/
 POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/set-default/
 
+# Curriculum Levels (nested under version)
+GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
+POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
+PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
+DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
+POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/reorder/
+
 # Curriculum Entries (nested under version)
 GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
 POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
@@ -583,6 +621,12 @@ PATCH  /api/v1/org/{slug}/settings/
 | 18 | Default department cannot be deleted | Prevents orphaning all courses/programs at a small institution that only ever has one department. Can be renamed freely |
 | 19 | All orgs/ business logic moved to use cases | Views were carrying membership hierarchy checks and org setup logic directly. Moved to `orgs/use_cases.py` for consistency with all other apps and to ensure atomic org creation |
 | 20 | `Organization.display_name` not `name` | The org model field is `display_name`. Any use case or code referencing the org's human-readable name must use `organization.display_name` |
+| 21 | `StudentExternalId` with org-configured `ExternalIdType` | Different clients have different external bodies. Free-text labels per student would cause inconsistency. Org-configured types ensure consistency while remaining flexible across clients |
+| 22 | `is_required` on ExternalIdType is soft enforcement only | External bodies are slow — blocking student creation until an ID is received causes real operational problems. `is_required` is a UI/reporting hint, not a hard constraint |
+| 23 | External ID enforcement at program level deferred | No client requirement exists yet. Implementation needs a junction model, enrollment validation logic, and frontend config UI |
+| 24 | Dedicated student search endpoint deferred | No immediate client requirement. Current search works; lacks visual match feedback for external ID hits. Acceptable for MVP |
+| 25 | Course-level enrollment tracking deferred to Phase 2 | MVP need is replacing a manual admission register. Course-level outcome tracking is a transcript feature not yet required by the client |
+| 26 | `CurriculumLevel` as a first-class model | Integer `level` field was implicit — no naming, no ordering guarantee, no metadata. A dedicated model allows free-text naming per level and explicit ordering independent of name. See ADR-026 |
 
 ---
 
@@ -610,10 +654,10 @@ PATCH  /api/v1/org/{slug}/settings/
 | Org context + routing | ✅ Complete |
 | Membership management | ✅ Complete |
 | Student CRUD + table | ✅ Complete |
-| Departments | ⬜ To Do |
-| Courses | ⬜ To Do |
-| Programs | ⬜ To Do |
-| Curriculum builder | ⬜ To Do |
+| Departments | ✅ Complete |
+| Courses | ✅ Complete |
+| Programs | ✅ Complete |
+| Curriculum builder | ✅ Complete |
 | Academic Terms | ⬜ To Do |
 | Enrollments | ⬜ To Do |
 
