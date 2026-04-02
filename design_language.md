@@ -1,360 +1,278 @@
-# Zavia – UI Design Language
-> Living document. Update when new patterns are established or existing ones are refined.
+# Zavia – Design Language
+> Last updated: April 2026
 
 ---
 
-## 1. Philosophy
+## The Principle
 
-Zavia's UI is inspired by Linear.app — minimal, high-information-density, and typography-driven. The interface steps back so the content steps forward. Every element earns its place.
+The interface should disappear. What remains is the work.
 
-**Core principles:**
-- **Typography over decoration** — hierarchy is communicated through font weight, size, and colour — not borders, shadows, or backgrounds
-- **Colour for meaning only** — colour is never decorative. It signals status, error, success, or warning
-- **Density over whitespace** — admin tools are used repeatedly by professionals. Compact, scannable layouts are preferred over airy, marketing-style layouts
-- **Workflow-driven** — the UI reflects real operational workflows, not CRUD forms. Every screen should answer "what is the user trying to accomplish?"
-- **No decorative elements** — no gradients, no shadows on cards, no illustrations, no icon decorations unless they carry meaning
+Every border, background, shadow, and colour that doesn't carry meaning is noise. Remove it. The user came to manage their institution — not to admire the UI. Design that calls attention to itself has failed.
+
+This is not minimalism for aesthetic reasons. It is restraint in service of focus.
 
 ---
 
-## 2. Colour System
+## Colour
 
-All colours are CSS custom properties defined in `src/index.css`. Never use hardcoded hex values — always use the design token.
+The UI is almost entirely monochromatic. Colour appears only when it means something.
 
-### Surfaces
-| Token | Usage |
-|---|---|
-| `background` | Page background — near white (light) / near black (dark) |
-| `surface` | Subtle raised surface — table headers, input backgrounds, tags |
-| `surface-raised` | Elevated surface — popovers, dropdowns, cards |
+**The palette in practice:**
+- 90% of the UI is `foreground`, `text-secondary`, `text-tertiary` on `background`
+- `surface` is used sparingly — table header rows, tag backgrounds, input fills
+- `accent` (blue) appears on: the active sidebar item, primary CTA buttons, and nothing else
+- `success` (green), `warning` (amber), `destructive` (red) appear on: status badges, error states, and nothing else
 
-### Borders
-| Token | Usage |
-|---|---|
-| `border` | Standard border — dividers, table outer borders |
-| `border-subtle` | Subtle border — table row separators, input borders at rest |
+**Never use colour to:**
+- Distinguish sections or group content
+- Make something look "important"
+- Add visual interest to an otherwise bare layout
 
-### Text
-| Token | Usage |
-|---|---|
-| `foreground` / `text-primary` | Primary content — headings, values, important labels |
-| `text-secondary` | Supporting content — descriptions, secondary values |
-| `text-tertiary` | De-emphasised content — placeholders, column headers, metadata |
+If you find yourself reaching for a colour that isn't signalling a status or action — stop. Use typography instead.
 
-### Semantic
-| Token | Usage |
-|---|---|
-| `accent` | Primary CTA buttons, active tab indicators, links |
-| `destructive` | Delete actions, error states, error borders |
-| `success` | Positive status — OPEN intake, active state |
-| `warning` | Caution status — UPCOMING intake, pending state |
+All colours are CSS tokens from `src/index.css`. Never hardcode hex values.
 
-### Status colour mapping
-| Status | Colour | Token |
+---
+
+## Typography
+
+Hierarchy is built entirely from font weight, size, and text colour. No decorative elements needed.
+
+| Role | Classes | Where |
 |---|---|---|
-| OPEN / Active | Green | `success` |
-| UPCOMING / Pending | Amber | `warning` |
-| CLOSED / Inactive | Grey | `text-tertiary` |
-| Error | Red | `destructive` |
-
----
-
-## 3. Typography
-
-No custom font — system font stack via Tailwind. Typography hierarchy is achieved through size + weight + colour combinations.
-
-### Scale in use
-| Role | Classes | Usage |
-|---|---|---|
-| Page title | `text-base font-semibold text-foreground` | Page and section headings |
+| Page heading | `text-base font-semibold text-foreground` | Page titles, entity names |
 | Section label | `text-xs font-medium uppercase tracking-wider text-text-tertiary` | Column headers, section dividers |
-| Body | `text-sm text-foreground` | Primary content in rows, forms |
-| Supporting | `text-sm text-text-secondary` | Descriptions, subtitles |
-| Metadata | `text-xs text-text-tertiary` | Timestamps, counts, codes |
-| Mono | `font-mono text-xs text-text-secondary` | Codes, IDs, technical values |
-
-### Rules
-- Never go below `text-xs` for readable content
-- `font-semibold` is reserved for headings and active states — not emphasis within body text
-- Uppercase tracking (`uppercase tracking-wider`) is reserved for section labels and column headers only
-
----
-
-## 4. Spacing & Layout
-
-### Page layout
-- Full-height shell with persistent sidebar
-- Content area: `px-6 py-4` for page headers, `p-6` for content areas
-- Maximum form width: `max-w-lg` for single-column forms
-- Maximum content width: unconstrained — tables fill available width
-
-### Component spacing
-- Form field groups: `gap-1.5` between label and input, `gap-5` between fields
-- Table row padding: `px-4 py-2.5`
-- Section padding: `px-6 py-4`
-- Inline action button padding: `p-1.5` (via `iconButtonClass`)
-
----
-
-## 5. Component Patterns
-
-### Buttons
-
-Four button types in use — defined in `src/components/ui/button-variants.ts`:
-
-| Variant | Usage |
-|---|---|
-| `default` (accent) | Primary CTA — one per view maximum |
-| `outline` | Secondary action alongside a primary CTA |
-| `ghost` | Low-emphasis actions, inline row actions |
-| `destructive` | Delete confirmations only |
-| `link` | Inline text actions, no chrome |
-
-Two bare button classes for cases where shadcn Button is too heavy:
-- `iconButtonClass` — icon-only table row actions
-- `navButtonClass` — breadcrumb and back navigation links
+| Body | `text-sm text-foreground` | Row content, form values |
+| Supporting | `text-sm text-text-secondary` | Subtitles, descriptions |
+| Metadata | `text-xs text-text-tertiary` | Timestamps, counts |
+| Code / ID | `font-mono text-xs text-text-secondary` | Codes, UUIDs, technical values |
 
 **Rules:**
-- Never more than one `default` (accent) button visible at a time
-- Destructive actions always require a confirmation dialog before executing
-- Icon buttons use `iconButtonClass`, never a full `Button` component
+- `font-semibold` only for headings and active nav states
+- `uppercase tracking-wider` only for section labels and column headers — never body text
+- Never below `text-xs` for readable content
+- Let colour carry the hierarchy — a `text-text-tertiary` label next to a `text-foreground` value communicates structure without any border or background
 
 ---
+
+## Surfaces and Containers
+
+This is where most interfaces go wrong. The default instinct is to wrap things in cards. Resist it.
+
+**Content floats on the page.** Sections are separated by spacing and typography — not by borders, backgrounds, or card chrome.
+
+**When to use a border:**
+- Around a list/table as a whole — one outer border, rows separated by subtle inner borders
+- Around an input field at rest
+- Around a tag or code badge
+
+**When not to use a border:**
+- Around a form section
+- Around a page content area
+- Around a group of related fields
+- Around anything that is "just content"
+
+**`surface` background is used for:**
+- Table header rows
+- Inline code/tag badges
+- Hovered sidebar items
+
+**Never use:**
+- Shadows on content (drawer shadow is the one exception)
+- Rounded cards with backgrounds for page sections
+- Coloured section backgrounds
+
+---
+
+## Layout
+
+### Pages
+The page header is lean. A title on the left, one action on the right. No hero sections, no descriptive paragraphs, no icon decorations.
+
+```
+px-6 py-4   — page header and content padding
+```
 
 ### Forms
+Forms feel like documents. Fields sit directly on the page — no wrapping card, no panel background. The page surface is the form surface.
 
-**Drawers** — for create/edit of entities with 3–6 fields that are contextually tied to a parent (e.g. editing an intake from its detail page). Uses Vaul drawer, slides from the right.
+```
+max-w-lg        — constrains single-column form width
+gap-1.5         — label to input
+gap-5           — field to field
+gap-8           — section to section
+```
 
-**Full page forms** — for create flows that require cross-entity selection (e.g. creating an intake requires selecting a program). Route: `/entity/new`.
+Section labels divide the form:
+```
+text-xs font-medium uppercase tracking-wider text-text-tertiary mb-4
+```
 
-**Inline edit rows** — for list entities with 1–2 editable fields (e.g. Departments). Edit state triggered by pencil icon, confirmed by check icon or Enter key.
-
-**Rules:**
-- No card wrappers on full page forms — fields sit directly on the page surface
-- Drawer width: `max-w-md`
-- Always include Cancel + Save in a bottom action bar
-- Save button shows `Loader2` spinner when saving
-- Field label always above input, never inline placeholder-only
-- Helper text (`text-xs text-text-tertiary`) below input when field meaning needs clarification
-
----
+No border, no background — just the label and spacing.
 
 ### Tables / Lists
+CSS grid, not `<table>`. Grid columns are defined per feature.
 
-All list views use a CSS grid layout — not `<table>` elements. Grid columns are defined explicitly per feature based on content needs.
-
-**Standard row structure:**
 ```
-grid-cols-[{col-definitions}] gap-4 items-center px-4 py-2.5
+grid-cols-[{definitions}] gap-4 items-center px-4 py-2.5
 border-b border-border-subtle last:border-0
 ```
 
-**Column header row:**
+Header row:
 ```
-grid-cols-[{same}] gap-4 px-4 py-2 bg-surface border-b border-border-subtle
+bg-surface border-b border-border-subtle
 text-xs font-medium uppercase tracking-wider text-text-tertiary
+px-4 py-2
 ```
-
-**Rules:**
-- Row actions (edit, delete) are hidden by default, visible on `group-hover` via `opacity-0 group-hover:opacity-100`
-- Action icons use `iconButtonClass`
-- Delete icon on hover: `hover:text-destructive hover:bg-destructive/5`
-- Monospaced values (codes, IDs): `font-mono text-xs text-text-secondary`
-- Empty values: render `—` (em dash), never blank
-- Numeric counts: `tabular-nums`, muted when zero
-
-**Responsive:**
-- Hide lower-priority columns below `md` breakpoint using `hidden md:block`
-- Always keep: name, status/primary value, actions visible on mobile
 
 ---
 
-### Empty States
+## Interaction Patterns
 
-Two patterns depending on context:
+### Hover reveals actions
+Rows are clean at rest. Edit, delete, and other row actions are invisible until hover. This keeps the list uncluttered when scanning and surfaces actions exactly when needed.
 
-**Full empty state** — when a list has no items at all. Centred, dashed border, icon + heading + subtext + implicit or explicit call to action.
+```tsx
+// Row
+<div className="group grid-cols-[...] ...">
 
-```
-rounded-lg border border-dashed border-border px-6 py-12
-text-center — PlusCircle icon, heading, subtext
-```
-
-**Compact add button** — when items exist and adding more is frequent (e.g. Add Level in curriculum). Dashed border, minimal padding, sits below the list.
-
-```
-rounded-lg border border-dashed border-border px-4 py-2
-w-full text-sm text-text-tertiary hover:text-foreground hover:border-border
+// Action — invisible at rest, visible on hover
+<button className={cn(iconButtonClass, "opacity-0 group-hover:opacity-100")}>
 ```
 
-**Rules:**
-- Empty state only when the list is genuinely empty — not on filter/search with no results (use a "no results" message instead)
-- Compact add button only when the add action is frequent and contextual — not for entities created via a separate page
+### Inline edit
+For simple entities (1–2 fields), edit happens inline in the row. No drawer, no page navigation. Pencil icon on hover → row transforms into an edit state → check/X to confirm or cancel.
+
+### Drawers
+For entities with 3–6 fields that are contextually tied to a parent. Right-side slide-in, `max-w-md`. The drawer is a focused editing surface — not a mini page.
+
+### Full page forms
+Only when the create flow requires cross-entity selection (e.g. selecting a program when creating an intake). Anything simpler belongs in a drawer.
+
+### Confirmation dialogs
+Every destructive action requires explicit confirmation. No exceptions. Single-click delete is never acceptable.
 
 ---
 
-### Status Badges
+## Empty States
 
-Inline badge showing current status. Coloured background with matching text.
+Two patterns only:
 
-**Pattern:**
+**Full empty state** — list has no items. Centred, dashed border container, icon + message + implicit action.
+```
+rounded-lg border border-dashed border-border
+px-6 py-12 text-center text-sm text-text-tertiary
+```
+
+**Compact add button** — items exist, adding more is a frequent action.
+```
+rounded-lg border border-dashed border-border
+w-full px-4 py-2 text-sm text-text-tertiary
+hover:text-foreground hover:border-border transition-colors
+```
+
+Use neither when the list has items and adding is infrequent — a header button is sufficient.
+
+---
+
+## Status Badges
+
+Small, tight, coloured pills. The only place in the UI where colour is used for state — each colour maps to a specific meaning, never applied arbitrarily.
+
 ```
 px-2 py-0.5 rounded-full text-xs font-medium
 ```
 
-**Interactive status badge** (e.g. IntakeStatusBadge):
-- Clicking opens a small absolute-positioned dropdown
-- Dropdown uses `useRef` + `useEffect` for outside-click detection
-- `type="button"` on all buttons to prevent form submission
-- Disabled + spinner during save
-- Current selection highlighted with `font-semibold`
-- Closes immediately on selection
+| Status | Colour |
+|---|---|
+| OPEN / Active | `success` green |
+| UPCOMING / Pending | `warning` amber |
+| CLOSED / Inactive | `text-tertiary` grey |
+| Error | `destructive` red |
+
+Interactive badges (status change inline) open a small dropdown on click. The dropdown is absolutely positioned, `z-50`, outside-click to dismiss.
 
 ---
 
-### Drawers
+## Buttons
 
-Right-side slide-in panel using Vaul. Used for create/edit forms.
+One primary button per view. Everything else is secondary or ghost.
 
-**Structure:**
+| Variant | When |
+|---|---|
+| `default` (accent fill) | The one primary action on the page |
+| `outline` | Secondary action alongside a primary |
+| `ghost` | Low-emphasis inline actions |
+| `destructive` | Inside confirmation dialogs only |
+| `iconButtonClass` | Icon-only row actions — lighter than Button |
+| `navButtonClass` | Breadcrumb links, back navigation |
+
+Destructive buttons never appear directly in the UI — only inside a confirm dialog after the user has initiated a delete action.
+
+---
+
+## Navigation
+
+### Sidebar
+Minimal. Icon + label, no section backgrounds, no nested trees deeper than one level. Active state is `font-semibold text-foreground` — not a coloured background.
+
+Structure:
 ```
-fixed right-0 top-0 bottom-0 z-50
-flex w-full max-w-md flex-col bg-background shadow-xl
+Dashboard
+─────────────
+Academic
+  Departments
+  Courses
+  Programs
+─────────────
+Operations
+  Intakes
+  Enrollments
+  Fees (future)
+─────────────
+Admin
+  Users
+  Settings
 ```
-
-- Title in header: `px-6 py-4 border-b border-border-subtle text-base font-semibold`
-- Form content: `flex flex-col gap-5 p-6 flex-1 overflow-y-auto`
-- Action bar: `mt-auto flex items-center justify-end gap-2 px-6 py-4 border-t border-border-subtle`
-- Overlay: `fixed inset-0 z-50 bg-black/40`
-- `onPointerDown={(e) => e.stopPropagation()}` on date inputs to prevent drawer drag interference
-
----
-
-### Confirm Delete Dialog
-
-Always used before destructive actions. Never delete on single click.
-
-- Title: "Delete {entity}"
-- Description: names the specific record being deleted
-- Confirm button: `destructive` variant
-- Shows error inline if delete fails (e.g. dependency check)
-- Busy state disables both buttons during deletion
-
----
 
 ### Breadcrumbs
-
-Used on detail and form pages. Sits above the page title.
-
+Used on detail and form pages. Maximum 3 levels.
 ```
-flex items-center gap-1.5 text-xs text-text-tertiary mb-3
+text-xs text-text-tertiary — links via navButtonClass
+ChevronRight w-3 h-3      — separator
+text-foreground            — current page (not a link)
 ```
-
-- Links use `navButtonClass`
-- Separator: `<ChevronRight className="w-3 h-3" />`
-- Current page: `text-foreground` (no link)
-- Maximum 3 levels deep
-
----
 
 ### Tabs
-
-Used on detail pages with multiple content sections.
-
+On detail pages with multiple content sections.
 ```
-border-b-2 transition-colors capitalize px-4 py-2 text-sm
-Active: border-foreground text-foreground font-medium
-Inactive: border-transparent text-text-secondary hover:text-foreground
+Active:   border-b-2 border-foreground text-foreground font-medium
+Inactive: border-b-2 border-transparent text-text-secondary hover:text-foreground
 ```
 
 ---
 
-### Section Labels
+## Z-Index
 
-Used to divide content areas and as table column headers.
-
-```
-text-xs font-medium uppercase tracking-wider text-text-tertiary
-```
-
----
-
-## 6. Page Structures
-
-### List page
-```
-Header row: title (left) + primary action button (right)
-Filter row: dropdowns for filtering (when applicable)
-Table: column headers + rows
-Empty state: when no items
-```
-
-### Detail page
-```
-Breadcrumb
-Header: title + code badge (if applicable) + subtitle + actions (edit, delete)
-Tab bar (if multiple sections)
-Tab content
-```
-
-### Full page form
-```
-Breadcrumb
-Page title
-Form sections with section labels
-Fields with labels and optional helper text
-Bottom action bar: Cancel + Save
-```
-
----
-
-## 7. Icons
-
-Lucide React — used throughout. Icon size conventions:
-
-| Context | Size |
+| Context | Value |
 |---|---|
-| Inline row action icons | `w-3.5 h-3.5` |
-| Button icons | `w-4 h-4` (handled by buttonVariants) |
-| Empty state icons | `w-8 h-8` or `w-6 h-6` |
-| Breadcrumb separator | `w-3 h-3` |
-| Loading spinner | `w-3.5 h-3.5 animate-spin` (inline), `w-4 h-4 animate-spin` (button) |
+| Inline dropdowns, search results | `z-10` |
+| Drawers and overlays | `z-50` |
+| Status badge dropdowns | `z-50` |
+
+Dropdowns inside tables must use `z-50`. Parent containers with `overflow-hidden` will clip them — use `overflow-visible` when dropdowns are present.
 
 ---
 
-## 8. Z-Index Scale
+## What We Never Do
 
-| Layer | Value | Usage |
-|---|---|---|
-| Dropdown menus | `z-10` | Inline dropdowns, search results |
-| Sticky elements | `z-20` | Sticky headers |
-| Drawers / overlays | `z-50` | Vaul drawers, modal overlays |
-| Status badge dropdown | `z-50` | Must clear table overflow |
-
-**Rule:** Always use `z-50` for absolutely-positioned menus that must clear table rows. Tables with `overflow-hidden` on parent containers will clip dropdowns — use `overflow-visible` on the table container when dropdowns are present.
-
----
-
-## 9. Dark Mode
-
-All colour tokens have dark mode equivalents defined in `src/index.css` under `.dark`. Dark mode is toggled by adding the `dark` class to `<html>`.
-
-**Rules:**
-- Never hardcode light-mode colours — always use tokens
-- Test all new components in both light and dark mode before marking complete
-- Status colours (`success`, `warning`, `destructive`) are adjusted for dark mode contrast
-
----
-
-## 10. What We Avoid
-
-- ❌ Card wrappers on full page forms
-- ❌ Shadows on list rows or content cards
-- ❌ Decorative illustrations or icons
-- ❌ Gradient backgrounds
-- ❌ More than one accent/primary button visible at once
-- ❌ Inline delete without confirmation
-- ❌ Colour for decoration — only for meaning
-- ❌ `<table>` elements — use CSS grid
-- ❌ Hardcoded hex colours
-- ❌ Font sizes below `text-xs` for readable content
-- ❌ Uppercase for body text — only for labels and column headers
+- Wrap form sections in cards
+- Use colour for decoration
+- Add shadows to content areas
+- Use more than one accent button per view
+- Delete without confirmation
+- Use `<table>` elements — CSS grid only
+- Hardcode colours
+- Show row actions without hover
+- Use uppercase for anything other than labels and column headers
+- Add decorative icons, illustrations, or gradients
