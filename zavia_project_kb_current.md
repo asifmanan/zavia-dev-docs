@@ -9,6 +9,7 @@
 
 - Student management
 - Academics management (Departments, Programs, Curriculum, Courses)
+- Intakes (cohort management)
 - Enrollment
 - Fee tracking
 - Institutional administration
@@ -88,6 +89,8 @@ src/
     departments/    (same structure)
     courses/        (same structure)
     programs/       (same structure)
+    curriculum/     (same structure)
+    intakes/        (same structure)
     enrollment/     (same structure)
     org/            (same structure)
     membership/     (same structure)
@@ -124,10 +127,14 @@ Every tenant is an **Organization**. All domain data is scoped to it.
 /o/{orgSlug}/departments
 /o/{orgSlug}/courses
 /o/{orgSlug}/programs
-/o/{orgSlug}/programs/:id
-/o/{orgSlug}/programs/:id/curriculum              ← redirects to default/first version
-/o/{orgSlug}/programs/:id/curriculum/:versionId   ← curriculum builder for a specific version
-/o/{orgSlug}/programs/:id/terms
+/o/{orgSlug}/programs/:id                          ← redirects to overview tab
+/o/{orgSlug}/programs/:id/overview
+/o/{orgSlug}/programs/:id/curriculum               ← redirects to default/first version
+/o/{orgSlug}/programs/:id/curriculum/:versionId    ← curriculum builder for a specific version
+/o/{orgSlug}/programs/:id/terms                    ← intakes tab on program detail
+/o/{orgSlug}/intakes                               ← flat org-wide intake list
+/o/{orgSlug}/intakes/new                           ← create intake (optionally pre-linked to program)
+/o/{orgSlug}/intakes/:id                           ← intake detail page
 /o/{orgSlug}/enrollments
 /o/{orgSlug}/admin/users
 /o/{orgSlug}/settings
@@ -139,6 +146,7 @@ Every tenant is an **Organization**. All domain data is scoped to it.
 /api/v1/org/{slug}/departments/
 /api/v1/org/{slug}/courses/
 /api/v1/org/{slug}/programs/
+/api/v1/org/{slug}/intakes/
 /api/v1/org/{slug}/enrollments/
 ```
 
@@ -326,10 +334,9 @@ Top-level academic offering of an institution (what institutions call "courses" 
 - name              CharField, required
 - code              CharField, optional
 - description       TextField, optional
-- duration          PositiveIntegerField, optional
-- duration_unit     CharField, choices=[YEARS, MONTHS], optional
+- duration          PositiveIntegerField, optional (stored as total months)
 - program_type      CharField, choices=[STANDARD, SHORT]
-- program_level     CharField, choices=[UNDERGRADUATE, POSTGRADUATE, DIPLOMA, CERTIFICATE, VOCATIONAL, OTHER], optional
+- program_level     CharField, choices=[UNDERGRADUATE, POSTGRADUATE, DOCTORATE, DIPLOMA, CERTIFICATE, VOCATIONAL, OTHER], optional
 - is_active         BooleanField, default=True
 - created_at        auto
 - updated_at        auto
@@ -408,19 +415,21 @@ Constraints:
 
 ---
 
-### `academic_terms/`
-Represents a cohort/intake/semester within a program. Terminology varies per institution — handled via free-text `name` + optional `term_type`.
+### `intakes/`
+Represents a cohort or intake within a program. Tracks when students are admitted and which curriculum version applies to them.
 
-**`AcademicTerm` model**
+> Previously named `academic_terms/`. Renamed to `intakes/` to better reflect the domain language used by the client. The URL path for the nested (program-scoped) endpoint retains `/terms/` for backward compatibility.
+
+**`Intake` model**
 ```
 - id                    UUID, PK
 - organization          FK → Organization
 - program               FK → Program
-- curriculum_version    FK → CurriculumVersion, optional (auto-assigned default)
-- name                  CharField (e.g. "Spring 2026", "Intake 03")
-- term_type             CharField, choices=[SEMESTER, INTAKE, TERM, BATCH], optional
-- start_date            DateField, optional
-- end_date              DateField, optional
+- curriculum_version    FK → CurriculumVersion, optional (auto-assigned default on create)
+- name                  CharField (e.g. "January 2026", "Intake 03")
+- status                CharField, choices=[UPCOMING, OPEN, CLOSED], default=UPCOMING
+- program_start_date    DateField, optional
+- program_end_date      DateField, optional
 - is_active             BooleanField, default=True
 - created_at            auto
 - updated_at            auto
@@ -429,34 +438,42 @@ Represents a cohort/intake/semester within a program. Terminology varies per ins
 Constraints:
 - `UniqueConstraint(program, name, condition=is_active=True)`
 
-If `OrganizationSettings.terms_enabled = False`, academic terms are not required on enrollment.
+**Status lifecycle:** `UPCOMING → OPEN → CLOSED`. Status can be changed inline from the list view via the status badge dropdown.
+
+If `OrganizationSettings.terms_enabled = False`, intakes are not required on enrollment.
+
+**Endpoints:** Two sets of endpoints exist:
+- **Nested (program-scoped):** `/api/v1/orgs/{slug}/programs/{program_id}/terms/` — used on the program detail page
+- **Flat (org-scoped):** `/api/v1/orgs/{slug}/intakes/` — used on the standalone intakes list page
+
+Both support `?search=` (name, min 2 chars), and the flat endpoint additionally supports `?program=<id>` and `?status=<value>` filters.
 
 ---
 
 ### `enrollments/`
-Records a student's enrollment in a program, optionally under a specific academic term.
+Records a student's enrollment in a program, optionally under a specific intake.
 
 **`Enrollment` model**
 ```
-- id                UUID, PK
-- organization      FK → Organization
-- student           FK → Student
-- program           FK → Program
-- academic_term     FK → AcademicTerm, optional (null if terms_enabled=False)
-- status            CharField, choices=[ACTIVE, COMPLETED, WITHDRAWN, SUSPENDED]
-- enrolled_at       DateTimeField, auto_now_add
-- is_active         BooleanField, default=True
-- created_at        auto
-- updated_at        auto
+- id            UUID, PK
+- organization  FK → Organization
+- student       FK → Student
+- program       FK → Program
+- intake        FK → Intake, optional (null if terms_enabled=False)
+- status        CharField, choices=[ACTIVE, COMPLETED, WITHDRAWN, SUSPENDED]
+- enrolled_at   DateTimeField, auto_now_add
+- is_active     BooleanField, default=True
+- created_at    auto
+- updated_at    auto
 ```
 
 Constraints:
-- `UniqueConstraint(student, program, academic_term)`
+- `UniqueConstraint(student, program, intake)`
 
 Business rules (enforced in use case):
 - If `allow_multiple_enrollments = False`: student can only have one ACTIVE enrollment per org
 - Cannot soft-delete an ACTIVE enrollment — must be withdrawn/completed first
-- Cannot delete an academic term that has active enrollments
+- Cannot delete an intake that has active enrollments
 
 ---
 
@@ -472,11 +489,11 @@ Organization
   │     │     │     ├── CurriculumLevel (named, ordered)
   │     │     │     │     └── CurriculumEntry ──→ Course (owned by a dept, borrowed here)
   │     │     │     └── CurriculumEntry (unassigned — curriculum_level=null)
-  │     │     └── AcademicTerm ──→ CurriculumVersion
+  │     │     └── Intake ──→ CurriculumVersion
   │     └── Course (owned by this department)
   └── Student
         └── Enrollment ──→ Program
-                       ──→ AcademicTerm (optional)
+                       ──→ Intake (optional)
 ```
 
 **Key relationship note:** A `Course` is owned by one `Department` (via FK). It can be included in any `Program`'s curriculum via `CurriculumEntry` regardless of which department owns the program. Ownership ≠ usage.
@@ -570,12 +587,19 @@ POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
 PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
 DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
 
-# Academic Terms (nested under program)
+# Intakes — nested (program-scoped)
 GET    /api/v1/org/{slug}/programs/{program_id}/terms/
 POST   /api/v1/org/{slug}/programs/{program_id}/terms/
 GET    /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
 PATCH  /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
 DELETE /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
+
+# Intakes — flat (org-scoped)
+GET    /api/v1/org/{slug}/intakes/              ?search=  ?program=  ?status=
+POST   /api/v1/org/{slug}/intakes/
+GET    /api/v1/org/{slug}/intakes/{id}/
+PATCH  /api/v1/org/{slug}/intakes/{id}/
+DELETE /api/v1/org/{slug}/intakes/{id}/
 
 # Enrollments
 GET    /api/v1/org/{slug}/enrollments/
@@ -605,10 +629,10 @@ PATCH  /api/v1/org/{slug}/settings/
 | 2 | `departments/` is a separate app | Will own staff, budgets, reporting — avoids painful migrations |
 | 3 | `curriculum/` is a separate app | Academic structure is distinct from program/course definition |
 | 4 | `CurriculumVersion` layer added | Allows curriculum revisions without disrupting existing enrollments |
-| 5 | `AcademicTerm` named neutrally | Clients use Intake/Semester/Term/Batch — free-text `name` handles all |
+| 5 | `academic_terms/` renamed to `intakes/` | "Intake" is the term used by the client and reflects domain language more accurately. The nested URL path `/terms/` is retained for backward compatibility. Model renamed from `AcademicTerm` to `Intake`; `term_type` replaced with `status` (UPCOMING/OPEN/CLOSED) |
 | 6 | `code` is optional on all models | Not all institutions use codes — forcing causes onboarding friction |
 | 7 | `allow_multiple_enrollments` is a setting | Some vocational institutions allow parallel program enrollments |
-| 8 | `terms_enabled` is a setting | Some institutions use rolling admissions without formal terms |
+| 8 | `terms_enabled` is a setting | Some institutions use rolling admissions without formal intakes |
 | 9 | Curriculum built at MVP, not deferred | Enrollment data references it — migrating on live data is costly |
 | 10 | Single active enrollment enforced in use case | DB constraints are binary; use case allows org-aware conditional enforcement |
 | 11 | `OrganizationSettings` auto-created on org creation | Every org needs settings from day one — prevents null reference errors |
@@ -626,7 +650,9 @@ PATCH  /api/v1/org/{slug}/settings/
 | 23 | External ID enforcement at program level deferred | No client requirement exists yet. Implementation needs a junction model, enrollment validation logic, and frontend config UI |
 | 24 | Dedicated student search endpoint deferred | No immediate client requirement. Current search works; lacks visual match feedback for external ID hits. Acceptable for MVP |
 | 25 | Course-level enrollment tracking deferred to Phase 2 | MVP need is replacing a manual admission register. Course-level outcome tracking is a transcript feature not yet required by the client |
-| 26 | `CurriculumLevel` as a first-class model | Integer `level` field was implicit — no naming, no ordering guarantee, no metadata. A dedicated model allows free-text naming per level and explicit ordering independent of name. See ADR-026 |
+| 26 | `CurriculumLevel` as a first-class model | Integer `level` field was implicit — no naming, no ordering guarantee, no metadata. A dedicated model allows free-text naming per level and explicit ordering independent of name |
+| 27 | Two intake endpoints (nested + flat) | The program detail page uses the nested endpoint (scoped to one program). The standalone intakes list page needs the flat org-scoped endpoint to show all intakes across all programs with cross-program filtering |
+| 28 | Duration stored as total months (integer) | Eliminates `duration_unit` field from Program model. Frontend decomposes into years + months for display and editing. Simpler comparisons and sorting. |
 
 ---
 
@@ -643,7 +669,7 @@ PATCH  /api/v1/org/{slug}/settings/
 | `courses/` | ✅ | ✅ | ✅ | Complete — `department` FK added |
 | `programs/` | ✅ | ✅ | ✅ | Complete — `department` on_delete tightened to PROTECT |
 | `curriculum/` | ✅ | ✅ | ✅ | Complete |
-| `academic_terms/` | ✅ | ✅ | ✅ | Complete |
+| `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters |
 | `enrollments/` | ✅ | ✅ | ✅ | Complete |
 
 ### Frontend
@@ -654,11 +680,11 @@ PATCH  /api/v1/org/{slug}/settings/
 | Org context + routing | ✅ Complete |
 | Membership management | ✅ Complete |
 | Student CRUD + table | ✅ Complete |
-| Departments | ✅ Complete |
-| Courses | ✅ Complete |
-| Programs | ✅ Complete |
+| Departments — list, inline edit, responsive table | ✅ Complete |
+| Courses — list, grouped by department, responsive table | ✅ Complete |
+| Programs — list (responsive table), detail page (overview + curriculum + intakes tabs) | ✅ Complete |
 | Curriculum builder | ✅ Complete |
-| Academic Terms | ⬜ To Do |
+| Intakes — list page (search, program/status filter), detail page, intakes tab on program | ✅ Complete |
 | Enrollments | ⬜ To Do |
 
 ---
@@ -669,8 +695,9 @@ PATCH  /api/v1/org/{slug}/settings/
 Core academic back-office for institution administrators.
 
 - ✅ Student registry
-- ✅ Academic structure backend (Departments → Programs → Curriculum → Courses → Enrollments)
-- ⬜ Frontend for academic structure
+- ✅ Academic structure backend (Departments → Programs → Curriculum → Courses → Intakes → Enrollments)
+- ✅ Frontend — Departments, Courses, Programs, Curriculum builder, Intakes
+- ⬜ Enrollments frontend
 - ⬜ Fee tracking / Payments
 
 ### Phase 2 — Academic Operations
