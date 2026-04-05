@@ -298,3 +298,47 @@ class CurriculumLevel(models.Model):
 - Enum level types (YEAR_1, SEMESTER_1 etc.) — rejected: too rigid for multi-institution SaaS
 - Storing level_count on Program — rejected: doesn't support named levels or per-version structure
 **Status:** Implemented
+
+---
+
+## ADR-027: Enrollment progression model — phased approach
+
+**Decision:** Student academic progression is modelled in three phases:
+
+- **Phase 1 (MVP):** `Enrollment` only — records the association between a
+  student, program, and intake. Status lifecycle: ACTIVE → SUSPENDED →
+  COMPLETED / WITHDRAWN.
+
+- **Phase 2:** `IntakePeriod` introduced — a scheduled segment of an intake
+  mapped to a CurriculumLevel, with a date range and status (UPCOMING, ACTIVE,
+  COMPLETED). This is the time axis that answers "where is this intake right
+  now in the curriculum?"
+
+- **Phase 2:** `EnrollmentCourse` introduced — records a student's association
+  with a specific course within a specific intake period. References Enrollment
+  + IntakePeriod + CurriculumEntry. Status: ENROLLED, PASSED, FAILED,
+  INCOMPLETE, WITHDRAWN. Grade and AttendanceRecord attach here.
+
+**Reasoning:**
+- A student progresses through individual courses, not years — year-level
+  progression is derived from course outcomes, not stored directly.
+- `IntakePeriod` bridges the academic calendar (time) and curriculum structure
+  (content). Without it, the system cannot answer which semester an intake is
+  currently on, or which courses a student is actively attending.
+- `CurriculumEntry` already carries course + level + order context — 
+  EnrollmentCourse references it directly rather than Course, avoiding
+  denormalisation.
+- Deferring IntakePeriod and EnrollmentCourse to Phase 2 keeps MVP simple
+  while ensuring the architecture extends cleanly without breaking existing
+  enrollment records.
+
+**Answers this model provides (Phase 2):**
+- Which semester is Intake 03 currently on?
+- What courses is Student X taking this semester?
+- Has Student X completed Year 1?
+- Which students are currently in Semester 3?
+
+**Deferred to Phase 3+:** Grade, AttendanceRecord (attach to EnrollmentCourse)
+
+**Status:** Partially implemented — Enrollment (MVP) complete.
+IntakePeriod and EnrollmentCourse deferred to Phase 2.
