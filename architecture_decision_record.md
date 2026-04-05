@@ -160,12 +160,25 @@ UniqueConstraint(
 
 ---
 
-## ADR-019: `enrollment_number` remains required on Student — nullable deferred
-**Decision:** `enrollment_number` stays as `CharField(max_length=8, editable=False)` — not nullable.
-**Reason:** Currently all student records are admin-created and always receive an enrollment number at creation. Making it nullable is only needed when the applicant flow is built (students can exist without a number until formally admitted).
-**When to revisit:** When building `admissions/` app — at that point make `null=True, blank=True` and only generate number at formal admission.
-**Current behaviour:** Enrollment number generated immediately on student creation via `generate_next_enrollment_number()` service.
-**Status:** Deferred
+## ADR-019: `enrollment_number` renamed to `student_id` on Student model
+
+**Original decision:** `enrollment_number` stays as required CharField,
+generated at Student creation.
+
+**Update (5 April 2026):** Field renamed to `student_id` on both backend
+and frontend to eliminate confusion with the `Enrollment` model introduced
+later. The field retains the same behaviour — generated at Student creation,
+permanent person identifier, never changes.
+
+**Reasoning for rename:**
+- `enrollment_number` implied a connection to an Enrollment record
+- Once the Enrollment feature was built, the naming caused genuine ambiguity
+- `student_id` is unambiguous — it identifies the person, not the transaction
+
+**Implemented:** Backend model, serializer, service function renamed.
+Frontend types and display labels updated.
+
+**Status:** Implemented
 
 ---
 
