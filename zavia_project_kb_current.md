@@ -248,19 +248,19 @@ Student registry within an organization.
 
 **`Student` model**
 ```
-- id                UUID, PK
-- organization      FK → Organization
-- enrollment_number CharField (YYMM-SEQ format, e.g. 2506-0001)
-- first_name        CharField
-- last_name         CharField
-- gender            CharField
-- date_of_birth     DateField
-- is_active         BooleanField, default=True
-- created_at        auto
-- updated_at        auto
+- id            UUID, PK
+- organization  FK → Organization
+- student_id    CharField (YYMM-SEQ format, e.g. 2506-0001)
+- first_name    CharField
+- last_name     CharField
+- gender        CharField
+- date_of_birth DateField
+- is_active     BooleanField, default=True
+- created_at    auto
+- updated_at    auto
 ```
 
-**Enrollment number format:** `YYMM` + zero-padded sequence per org per month (e.g. `2506-0001`, `2506-0002`). Generated in use case on create.
+**Student ID format:** `YYMM` + zero-padded sequence per org per month (e.g. `2506-0001`, `2506-0002`). Generated in use case on create.
 
 **Implemented:** create, retrieve, update, list, soft delete, dependency check before delete
 
@@ -474,6 +474,34 @@ Business rules (enforced in use case):
 - If `allow_multiple_enrollments = False`: student can only have one ACTIVE enrollment per org
 - Cannot soft-delete an ACTIVE enrollment — must be withdrawn/completed first
 - Cannot delete an intake that has active enrollments
+
+**Enrollment progression models (planned — Phase 2)**
+
+**`IntakePeriod` model**
+```
+- id                UUID, PK
+- intake            FK → Intake
+- curriculum_level  FK → CurriculumLevel
+- name              CharField (e.g. "Semester 1", "Semester 2")
+- start_date        DateField
+- end_date          DateField
+- status            CharField, choices=[UPCOMING, ACTIVE, COMPLETED]
+```
+
+Represents a time-bound segment of an intake mapped to a specific curriculum level (e.g. Semester 1 maps to Year 1). Enables tracking student progression through levels over time.
+
+**`EnrollmentCourse` model**
+```
+- id                UUID, PK
+- enrollment        FK → Enrollment
+- intake_period     FK → IntakePeriod
+- curriculum_entry  FK → CurriculumEntry
+- status            CharField, choices=[ENROLLED, PASSED, FAILED, INCOMPLETE, WITHDRAWN]
+```
+
+Records a student's participation in a specific course within an intake period. Acts as the attachment point for Grade and AttendanceRecord in Phase 3.
+
+> Grade and AttendanceRecord will attach to `EnrollmentCourse` in Phase 3.
 
 ---
 
