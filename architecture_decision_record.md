@@ -256,7 +256,7 @@ Append the following entry at the end of the file:
 
 ## ADR-025: Course-level enrollment tracking deferred to Phase 2
 **Decision:** MVP enrollment model tracks program-level enrollment only (Student → Program → AcademicTerm). Individual course registration and outcome tracking per student is deferred.
-**Reason:** AMMIMS immediate need is replacing their manual admission register — knowing who is enrolled in which program and intake. Course-level outcome tracking (pass/fail per course, retakes, cross-intake course borrowing) is a transcript feature not yet required by the client.
+**Reason:** Clients' immediate need is replacing their manual admission register — knowing who is enrolled in which program and intake. Course-level outcome tracking (pass/fail per course, retakes, cross-intake course borrowing) is a transcript feature not yet required by the client.
 **Limitation:** The current model cannot represent scenarios where a student failed a course in one intake and is retaking it alongside courses from a new intake. All students in an enrollment are assumed to follow the full curriculum of their intake.
 **Future model when needed:**
 ```python
@@ -786,3 +786,215 @@ def compute_late_fee(instalment, settings):
 - Storing late fee as a `CONCESSION` with negative label — rejected: concessions are credits; a late fee is a debit. Semantically incorrect and architecturally inconsistent with ADR-034.
 
 **Status:** Implemented
+
+---
+
+## ADR-038: `tax/` as a separate Django app for tax rate management
+
+**Decision:** Tax rate configuration lives in a dedicated `tax/` app,
+not in `fees/` or `orgs/`.
+
+**Model:**
+```python
+class TaxRate(models.Model):
+    id              UUID, PK
+    organization    FK → Organization, on_delete=PROTECT
+    name            CharField, max_length=100
+    rate            DecimalField, max_digits=5, decimal_places=2
+    is_active       BooleanField, default=True
+    created_at      auto
+    updated_at      auto
+
+    class Meta:
+        ordering = ['name']
+        constraints = [
+            UniqueConstraint(
+                fields=['organization', 'name'],
+                condition=Q(is_active=True),
+                name='unique_active_tax_rate_name_per_org'
+            )
+        ]
+```
+
+**Reason:** Tax is a cross-domain financial concern — not a fees
+concern specifically. If future modules (library, hostel, payroll)
+require taxable charges, they would need to import TaxRate from
+fees/ which would be architecturally wrong. A dedicated tax/ app
+owns the concept cleanly and allows tax reporting, exemption
+certificates, and return summaries to be added later without
+touching fees/ or orgs/.
+
+**Alternatives considered:**
+- `fees/` — rejected: tax is not a fees-specific concept
+- `orgs/` — rejected: orgs/ handles identity and membership,
+  not financial configuration
+
+**Status:** Implemented
+
+---
+
+## ADR-039: Tax fields on `FeeHead` and `LedgerEntry` — tax exclusive, stored snapshots
+
+**Decision:** Tax is modelled as tax exclusive — `charged_amount`
+on `LedgerEntry` is the pre-tax net amount. `tax_amount` and
+`gross_amount` are computed at ledger generation time and stored
+as immutable snapshots alongside `charged_amount`.
+
+**Fields added to `FeeHead`:**
+```python
+tax_rate    FK → TaxRate, on_delete=SET_NULL,
+            null=True, blank=True
+            # null = not taxable
+```
+
+**Fields added to `LedgerEntry`:**
+```python
+is_taxable          BooleanField, default=False
+tax_rate_snapshot   DecimalField, max_digits=5,
+                    decimal_places=2, null=True
+                    # snapshot of TaxRate.rate at generation time
+tax_amount          DecimalField, max_digits=10,
+                    decimal_places=2, default=Decimal('0.00')
+                    # charged_amount * tax_rate_snapshot / 100
+                    # stored snapshot — never recomputed
+gross_amount        DecimalField, max_digits=10,
+                    decimal_places=2, default=Decimal('0.00')
+                    # charged_amount + tax_amount
+                    # stored snapshot — never recomputed
+```
+
+**Why tax exclusive:**
+Tax exclusive is the international standard (IFRS, GAAP, VAT/GST
+regulations globally). Revenue is recognised at the net amount;
+tax is a liability collected on behalf of the government. Every
+serious accounting system (Xero, QuickBooks, SAP, Stripe) uses
+this approach. Tax inclusive hides the tax inside charged_amount
+making it impossible to report net revenue or tax liability
+accurately without backing out tax from every record.
+
+**Why gross_amount is stored, not computed:**
+Both `charged_amount` and `gross_amount` are financial record
+snapshots. Storing `gross_amount` as a field rather than a
+property ensures the figure is immutable and independently
+auditable — consistent with how `charged_amount` and `head_name`
+are already treated. A computed property could silently drift
+if either component field were ever amended via a correction.
+
+**Balance computation uses gross_amount:**
+`FeeLedger.balance` sums `gross_amount` (not `charged_amount`)
+across active entries — this is the total student obligation
+including tax. `charged_amount` is available for net revenue
+reporting. `tax_amount` is available for tax liability reporting.
+
+**Migration note — existing rows:**
+When this migration runs on a system with existing `LedgerEntry`
+records, `gross_amount` defaults to `Decimal('0.00')`. This is
+safe only on pre-production systems. On any system with live
+financial data, a data migration must be run immediately after
+to backfill `gross_amount = charged_amount` on all existing
+rows (all existing entries are non-taxable, so
+`gross_amount = charged_amount` is correct for them).
+
+**Future tax features (deferred):**
+- GST/VAT return summary endpoint
+- Tax exemption certificates per student
+- Tax registration number on invoices (Phase 2, PDF)
+- Compound tax (tax on tax — rare, jurisdiction specific)
+- Reverse charge VAT (B2B EU — not relevant for education)
+
+**Status:** Implemented
+
+---
+
+## ADR-040: Currency, locale, and timezone settings on `OrganizationSettings`
+
+**Decision:** Currency display, number formatting, timezone, and
+date format are stored as org-level settings on
+OrganizationSettings. These are display and formatting concerns
+only — all monetary values are stored as plain DecimalField in
+the database with no currency encoding at the data layer.
+
+**Fields added to `OrganizationSettings`:**
+```python
+# Currency
+currency_code       CharField, max_length=3, default='GBP'
+                    # ISO 4217 currency code
+currency_symbol     CharField, max_length=5, default='£'
+                    # display symbol
+
+# Locale
+timezone            CharField, max_length=50,
+                    default='Europe/London'
+                    # IANA timezone string
+                    # Europe/London (not UTC) — correctly
+                    # handles BST (GMT+1 in summer)
+date_format         CharField, max_length=20,
+                    default='DD/MM/YYYY'
+                    # frontend display format only
+                    # DB always stores ISO 8601
+
+# Number formatting
+currency_position   CharField, max_length=6,
+                    choices=[PREFIX, SUFFIX],
+                    default='PREFIX'
+                    # PREFIX: £50,000 / SUFFIX: 50,000£
+decimal_separator   CharField, max_length=1, default='.'
+thousands_separator CharField, max_length=1, default=','
+```
+
+**Why display-only (no MoneyField or currency-encoded storage):**
+Zavia is single-currency per org — one institution operates
+in one currency. Storing the currency code once on
+OrganizationSettings and applying it at display time is the
+correct separation of concerns. Coupling monetary values to
+currency codes at the data layer (MoneyField pattern)
+complicates arithmetic, aggregation, and ORM queries with
+no benefit for single-currency orgs. Multi-currency support
+(accepting payments in foreign currencies) is a future
+concern not required by any current client.
+
+**Why Europe/London not UTC:**
+UTC does not observe Daylight Saving Time. Europe/London
+correctly handles GMT (winter) and BST/GMT+1 (summer).
+Using UTC as the default for a UK-targeted product would
+cause due date and overdue calculations to be off by one
+hour during British Summer Time. Always use IANA timezone
+names — never raw UTC offsets.
+
+**Default rationale — GBP / Europe/London / DD/MM/YYYY:**
+Zavia targets the UK market as its primary market. GBP,
+Europe/London, and DD/MM/YYYY are the correct defaults for
+a UK-first product. These defaults are safety fallbacks only
+— the onboarding flow detects the admin's browser locale
+(via Intl.DateTimeFormat and navigator.language) and
+pre-populates settings before the org is created. In
+practice the DB default is never used if onboarding
+is completed correctly.
+
+**Onboarding flow (frontend, to be implemented):**
+```javascript
+// Detect from browser at org creation time
+const timezone = Intl.DateTimeFormat()
+    .resolvedOptions().timeZone
+const locale = navigator.language
+// Pre-populate settings form — admin confirms or overrides
+// On save → stored on OrganizationSettings
+```
+
+**Timezone usage in backend:**
+- DateField values (due_date, transaction_date) store
+  date only — timezone does not affect stored values
+- DateTimeField values (created_at, updated_at) stored
+  as UTC in DB — standard Django behaviour
+- Backend uses timezone setting when computing relative
+  date comparisons (e.g. overdue checks in
+  compute_late_fee) via django.utils.timezone
+- Frontend uses timezone setting to display datetime
+  values in the institution's local time
+
+**Date format usage:**
+- Backend always stores and returns ISO 8601 (YYYY-MM-DD)
+- Frontend uses date_format setting for display only
+- No backend date formatting — purely a frontend hint
+
+**Status:** Planned
