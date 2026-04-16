@@ -1,5 +1,5 @@
 # Zavia — Architecture Decision Records
-> Last updated: April 2026
+> Last updated: 16 April 2026
 
 ---
 
@@ -102,16 +102,28 @@ UniqueConstraint(
 
 ---
 
-## ADR-013: Soft delete + dependency checks in use case layer
+## ADR-013: Soft delete + dependency checks in use case layer (Updated)
 **Decision:** All deletes are soft (`is_active=False`). Before soft deleting, use cases check for active dependencies and raise `ValidationError` if found.
-**Dependency checks:**
+
+**Dependency checks — Academic domain (existing):**
 - Student delete → blocked if ACTIVE enrollment exists
 - Program delete → blocked if ACTIVE enrollments exist
-- AcademicTerm delete → blocked if ACTIVE enrollments exist
-- Department delete → blocked if active Programs exist
+- AcademicTerm/Intake delete → blocked if ACTIVE enrollments exist
+- Department delete → blocked if active Programs or Courses exist
 - Course delete → blocked if active CurriculumEntries exist
-**Reason:** Hard deletes are irreversible. Deleting a record with active dependencies would orphan related data and break reporting.
-**Status:** Implemented
+
+**Dependency checks — Fees domain (added):**
+- FeeStructure delete → blocked if any active `FeeStructureIntake` assignment exists
+- FeeHead delete → blocked if any `LedgerEntry` references it (snapshot exists — the charge has been raised against a student)
+- FeeSchedule delete → blocked if any `FeeLedger` references it (schedule has been materialised into instalment rows)
+- FeeLedger delete → blocked if any `LedgerTransaction` exists against it (financial movements have been recorded — ledger is part of audit trail)
+
+**Reason:** Hard deletes are irreversible. Deleting a record with active dependencies would orphan related data and break reporting. For financial records specifically, deletion after any transaction has been posted is an accounting integrity violation — the audit trail must remain intact.
+
+**Note on FeeHead:** `FeeHead` uses `on_delete=SET_NULL` on the
+`LedgerEntry.fee_head` FK — meaning the FK is nulled if the head is hard deleted at the DB level. However soft delete is enforced in the use case before this is ever reached. The `SET_NULL` is a safety net only.
+
+**Status:** Implemented (academic domain) / Planned (fees domain)
 
 ---
 
@@ -355,3 +367,422 @@ class CurriculumLevel(models.Model):
 
 **Status:** Partially implemented — Enrollment (MVP) complete.
 IntakePeriod and EnrollmentCourse deferred to Phase 2.
+
+---
+
+## ADR-028: List-page pattern for heavyweight entity pages
+**Decision:** Heavyweight entity pages (Students, Enrollments, future Teachers, future Fees) adopt a shared list-page pattern:
+
+1. **List-as-default.** The page opens directly to the entity table. Users do not have to search, click, or interact to see data.
+2. **Primary actions are always visible.** "New X", "Import", and other primary CTAs render as buttons in the page header — never hidden behind a keyboard shortcut or palette.
+3. **Filter toolbar is always visible.** Search input + entity-specific filter selects live in the toolbar above the table, inside the `p-6` content wrapper. Filters are never hidden behind a command palette.
+4. **Command palette is an accelerator, not a primary surface.** The palette provides fast navigation and action execution for power users, but every action it contains is also reachable through visible UI.
+5. **Right rail is permitted but optional.** Heavyweight pages may add a `w-[300px]` right rail at `xl:` breakpoint for at-a-glance context (breakdowns, activity, trends). The rail must not hold actions that are not also reachable elsewhere.
+6. **Bulk action bar is inline and conditional.** When selection > 0, a dark inline bar appears above the table with bulk actions. It is never persistent chrome.
+
+**Reason:** Admin workflows on entity pages are dominated by browse-filter-act patterns, not known-item lookup. Hiding the list behind a search surface forces the majority of users to take an extra step for every visit. It also breaks convention with every other back-office tool (SIS, CRM, Google Admin) where clicking an entity name opens a list.
+
+The palette is still valuable — it accelerates the known-item workflow for power users and provides a unified jump-to-anywhere affordance — but making it the only path inverts the cost/benefit: the 80% are taxed to marginally please the 20% who already know the shortcut.
+
+**Keyboard shortcut hierarchy:**
+- **Primary: `/`** — single keystroke, no modifier, does not conflict with browser chrome shortcuts. Only triggers when focus is not already in an input/textarea/select.
+- **Secondary: `⌘K` / `Ctrl+K`** — wired as a familiar accelerator for users coming from Linear, Slack, GitHub, etc.
+
+`⌘K` / `Ctrl+K` is deliberately *secondary* because Firefox-family browsers (including Zen Browser and LibreWolf) bind `Ctrl+K` to the browser search bar. In those browsers the shortcut may be intercepted by browser chrome before the page handler runs. `/` is reliable across all browsers and provides a safe primary affordance.
+
+**Applies to:** Students (Phase 1), Enrollments (Phase 1), Fees (Phase 1), Teachers (Phase 3), and any future entity with list-level admin operations.
+
+**Does not apply to:** Narrow entity pages that are purely list+drawer (Departments, Courses) — those remain on the existing lightweight shell.
+
+**Alternatives considered:**
+- *Command-palette-first, empty centered search on landing* — rejected. Breaks convention for declared-intent navigation and taxes the common case. Appropriate only for zero-context entry points (global search, launchers).
+- *Metrics strip above the table on every list page* — rejected as default. Metrics live in the optional right rail when present; otherwise summary counts appear as inline text next to the page title.
+
+**Implementation scope (Phase 1 — Students):**
+- Header: title + inline count summary + visible "New Student" + "Import" + palette trigger button
+- Toolbar: search input + intake / program / status selects + "Clear filters" + result counter
+- Table: checkbox column, avatar initials, student name, student ID, program, intake, status
+- Bulk action bar: dark inline bar, appears when selection > 0
+- Command palette: `/` primary, `⌘K` secondary, Jump-to + Actions groups only (no Filter-by group — filters live in toolbar)
+- **No right rail in Phase 1.** Main content takes full width.
+
+**Phase 2 additions (deferred):**
+- Right rail sections: status breakdown (bars), intake distribution (bars), "new this month" sparkline, recent activity feed
+- Backend dependencies: activity feed requires an audit log model; sparkline requires a time-series aggregation endpoint
+
+**Status:** Approved — Phase 1 implementation pending
+
+---
+
+## ADR-029: fees/ as a separate Django app
+**Decision:** All fee-related models (FeeStructure, FeeHead, FeeSchedule, ScheduleInstalment, FeeStructureIntake, FeeLedger, LedgerEntry, LedgerInstalment, LedgerTransaction) live in a dedicated fees/ app.
+**Reason:** Fees are a financially distinct domain-independent lifecycle, separate reporting, future payment gateway integration. Coupling to enrollments/ or students/ would create a bloated app with mixed concerns. A separate app allows the fees domain to grow (invoicing, gateway, receipts) without touching academic models.
+Alternatives considered: Extending enrollments/ app with fee models.
+**Status:** Planned
+
+---
+
+## ADR-030: FeeStructure is a standalone org-scoped template
+**Decision:** FeeStructure has no FK to Program or Intake. It is a named org-scoped template assigned to intakes via a junction model (FeeStructureIntake).
+**Reason:** Fees change annually — a program-level default would be stale almost immediately and every intake would override it anyway, making program-level structure a redundant concept. A standalone template that can be assigned to one or multiple intakes is more honest. One well-designed structure (e.g. "Health Tech Fees 2026") can be reused across intakes with identical fees without duplication.
+**Model:**
+```
+class FeeStructure(models.Model):
+    id              UUID, PK
+    organization    FK → Organization
+    name            CharField
+    is_active       BooleanField, default=True
+    created_at      auto
+    updated_at      auto
+```
+**Alternatives considered:** FK from FeeStructure to Program with nullable Intake override — rejected because it creates an unnecessary program-level fallback that becomes stale and is always overridden in practice.
+**Status:** Planned
+
+---
+
+## ADR-031: FeeStructureIntake junction model — one active structure per intake
+**Decision:** FeeStructure and Intake are associated via a junction model FeeStructureIntake. A unique constraint enforces one active structure per intake.
+**Reason:** The relationship is genuinely M2M — one structure can apply to multiple intakes (e.g. fees unchanged for two consecutive intakes). A junction table is the honest representation. Uniqueness at the intake level is enforced to prevent ambiguity in ledger generation.
+**Model:**
+```
+class FeeStructureIntake(models.Model):
+    id              UUID, PK
+    fee_structure   FK → FeeStructure
+    intake          FK → Intake
+    is_active       BooleanField, default=True
+    created_at      auto
+
+    class Meta:
+        constraints = [
+            UniqueConstraint(
+                fields=['fee_structure', 'intake'],
+                name='unique_structure_intake_pair'
+            ),
+            UniqueConstraint(
+                fields=['intake'],
+                condition=Q(is_active=True),
+                name='unique_active_structure_per_intake'
+            )
+        ]
+```
+**Replacing a structure on an intake:** Use case deactivates the existing assignment and creates a new one atomically. Blocked if ledgers already exist for that intake.
+**Status:** Planned
+
+---
+
+## ADR-032: FeeHead is editable until first LedgerEntry references it — then locked
+**Decision:** FeeHead amount and name are freely editable until a LedgerEntry exists that references it. Once referenced, the head is locked for editing. New heads can always be added to a structure. A head can only be deleted if no LedgerEntry references it.
+**Reason:** Locking the entire FeeStructure on first ledger generation (as initially considered) was too coarse — it prevented legitimate additions like Semester 2 fees added after Semester 1 ledgers were already generated. Locking at the FeeHead level is the correct granularity. LedgerEntry snapshots (head_name, charged_amount) protect historical records regardless of head state.
+**New head propagation:** When a new FeeHead is added to a structure that already has active ledgers, the use case automatically creates a new LedgerEntry on every active ledger for that structure. Runs in a single transaction.atomic().
+**Model:**
+```
+class FeeHead(models.Model):
+    id              UUID, PK
+    organization    FK → Organization
+    structure       FK → FeeStructure
+    name            CharField
+    amount          DecimalField(max_digits=10, decimal_places=2)
+    period_label    CharField, null=True, blank=True  # "Semester 1" — display only
+    order           PositiveIntegerField
+    is_active       BooleanField, default=True
+    created_at      auto
+    updated_at      auto
+```
+**Phase 2 note:** period_label will gain a nullable FK to IntakePeriod when that model is introduced. Existing heads with period_label set and intake_period=null remain valid as unassigned charges.
+**Status:** Planned
+
+---
+
+## ADR-033: `FeeLedger` generation strategy — auto on enrollment, manual bulk for existing enrollments (Updated)
+**Decision:** Ledger generation follows two paths:
+- **Auto:** When a student is enrolled and a fee structure is already assigned to the intake, `generate_fee_ledger` is called inside `create_enrollment` within the same `transaction.atomic()`.
+- **Manual bulk:** Admin triggers "Generate Ledgers" on a fee structure or intake after the fact. Applies to all active enrollments for that intake that do not yet have a ledger. This is an onboarding/migration tool — not part of the normal workflow once the system is live.
+
+**Empty ledger is always created:** Even if no fee structure is assigned to the intake at enrollment time, a `FeeLedger` record is still created for the student with zero `LedgerEntry` rows. This ensures every enrolled student always has a ledger to post transactions against if needed — without requiring a fee structure to exist first. Enrollment is never blocked by fee configuration state.
+
+**Resolution logic:**
+```python
+def resolve_fee_structure(intake):
+    mapping = FeeStructureIntake.objects.filter(
+        intake=intake,
+        is_active=True
+    ).select_related('fee_structure').first()
+    return mapping.fee_structure if mapping else None
+
+# Inside create_enrollment (same transaction.atomic()):
+enrollment = Enrollment(...)
+enrollment.save()
+
+ledger = FeeLedger.objects.create(
+    organization=organization,
+    student=student,
+    enrollment=enrollment,
+)
+
+structure = resolve_fee_structure(intake)
+if structure:
+    generate_ledger_entries(ledger=ledger, structure=structure)
+    assign_default_schedule(ledger=ledger, structure=structure)
+```
+
+**Manual bulk trigger behaviour:**
+- Applies to all ACTIVE enrollments for the intake with no existing ledger
+- All-or-nothing: generates for all qualifying enrollments, not selectable per student — this is a compliance requirement (see ADR-032 discussion)
+- Action is logged: "Ledgers generated for Intake X — N students — by [user] on [date]"
+- Idempotent: re-running does not duplicate ledgers — use case checks for existing ledger before creating
+
+**Reason:** Auto-generation is the correct default once the system is live.
+The manual bulk trigger handles the bootstrapping problem — institutions onboarding with students already enrolled before any fee structure was configured. Once live, the manual trigger becomes a rarely used safety net.
+
+**Status:** Planned
+
+---
+
+## ADR-034: LedgerEntry stores snapshot fields — charged amount never mutates
+**Decision:** `LedgerEntry` stores `head_name` and `charged_amount` as snapshots at time of ledger generation. These fields never change after creation regardless of subsequent `FeeHead` edits.
+**Reason:** A student's fee obligation is established at the point of ledger generation. Retroactive changes to fee head amounts must not affect existing financial records — this is both an accounting principle and a compliance requirement.
+**Model:**
+```python
+class LedgerEntry(models.Model):
+    id              UUID, PK
+    ledger          FK → FeeLedger
+    fee_head        FK → FeeHead, null=True, on_delete=SET_NULL
+    head_name       CharField       # snapshot
+    charged_amount  DecimalField    # snapshot — never mutated
+    period_label    CharField, null=True  # snapshot of FeeHead.period_label
+    is_active       BooleanField, default=True
+    created_at      auto
+    updated_at      auto
+```
+`fee_head` FK is nullable (`on_delete=SET_NULL`) — if a head is soft deleted, the ledger entry remains intact with its snapshot values. The financial record is never orphaned.
+**Status:** Planned
+
+---
+
+## ADR-035: `LedgerTransaction` unifies all post-generation ledger movements
+
+**Decision:** Payments, concessions, additional charges, and reversals are all represented as `LedgerTransaction` records distinguished by `transaction_type`. Transactions carry a directional effect on the ledger balance — credits reduce it, debits increase it.
+
+**Transaction types and their direction:**
+
+| Type | Direction | Description |
+|---|---|---|
+| `PAYMENT` | Credit | Money received from student |
+| `CONCESSION` | Credit | Scholarship, discount, hardship waiver |
+| `ADDITIONAL_CHARGE` | Debit | Late fee penalty, miscellaneous addition |
+| `REVERSAL` | Correction | Corrects an incorrectly recorded transaction |
+
+**Reason:** From an accounting standpoint, payments and concessions are both credit transactions against an accounts receivable ledger — they reduce what the student owes. Additional charges (e.g. late fee penalties) are debit transactions — they increase what the student owes. Separating these into different models creates artificial complexity, splits the audit trail, and complicates balance computation. A unified transaction log with explicit direction is how real accounting ledgers work.
+
+Crucially, concessions and additional charges are semantically opposite — conflating them (e.g. recording a late fee as a "concession with negative label") is architecturally incorrect and misleading in reporting.
+
+**Model:**
+```python
+class LedgerTransaction(models.Model):
+    id                  # UUID, PK
+    organization        # FK → Organization
+    ledger              # FK → FeeLedger
+    transaction_type    # CharField, choices=[
+                        #     PAYMENT,
+                        #     CONCESSION,
+                        #     ADDITIONAL_CHARGE,
+                        #     REVERSAL,
+                        # ]
+    amount              # DecimalField — always positive
+    transaction_date    # DateField
+
+    # Payment-specific (null for other types)
+    payment_method      # CharField, choices=[CASH, BANK_TRANSFER, CHEQUE, OTHER], null=True
+    reference_number    # CharField, null=True, blank=True
+
+    # Concession / Additional Charge specific (null for PAYMENT)
+    label               # CharField, null=True
+                        # e.g. "Merit Scholarship", "Late Fee Penalty"
+
+    # Shared
+    note                # TextField, blank=True
+    recorded_by         # FK → User
+    is_active           # BooleanField, default=True
+    created_at          # auto
+    updated_at          # auto
+```
+
+**Balance computation:**
+```python
+@property
+def balance(self):
+    total_charged = sum(
+        e.charged_amount for e in self.entries.filter(is_active=True)
+    )
+    credits = sum(
+        t.amount for t in self.transactions.filter(
+            transaction_type__in=[PAYMENT, CONCESSION],
+            is_active=True
+        )
+    )
+    debits = sum(
+        t.amount for t in self.transactions.filter(
+            transaction_type=ADDITIONAL_CHARGE,
+            is_active=True
+        )
+    )
+    return total_charged + debits - credits
+```
+
+**REVERSAL type** is included for future-proofing — correcting an incorrectly recorded transaction without deleting financial records. Deletion of transaction records is an accounting red flag. Reversal semantics (which transaction it corrects, full vs partial) are deferred to Phase 2 when the requirement concretely arises.
+
+**Reporting filters by type:**
+- Collections report → filter `PAYMENT`
+- Concessions report → filter `CONCESSION`
+- Penalties report → filter `ADDITIONAL_CHARGE`
+- Full audit trail → all types ordered by `transaction_date`
+
+**Alternatives considered:**
+- Separate `Concession` and `Payment` models — rejected: splits audit trail, complicates balance computation, two queries with different semantics.
+- `Concession` model with negative amounts for penalties — rejected: semantically incorrect, concessions are credits and cannot represent debits.
+
+**Status:** Planned
+
+---
+
+## ADR-036: Instalment schedule is a template on `FeeStructure` — materialised per ledger (Updated)
+
+**Decision:** `FeeSchedule` and `ScheduleInstalment` define the instalment
+template on the structure. `LedgerInstalment` is the materialised per-student
+copy generated when the ledger is created. The two layers are independent
+after generation.
+
+**Reason:** A template cannot hold student-specific due dates or amounts —
+these depend on enrollment date and net fees after transactions. Materialising
+the schedule per ledger allows per-student overrides and recalculation without
+touching the template.
+
+**Models:**
+```python
+class FeeSchedule(models.Model):
+    id              # UUID, PK
+    organization    # FK → Organization
+    structure       # FK → FeeStructure
+    name            # CharField — e.g. "3-Instalment Plan", "Full Payment"
+    is_default      # BooleanField, default=False
+    is_active       # BooleanField, default=True
+    created_at      # auto
+    updated_at      # auto
+
+
+class ScheduleInstalment(models.Model):
+    id                        # UUID, PK
+    schedule                  # FK → FeeSchedule
+    label                     # CharField — e.g. "Upon Admission", "Instalment 2"
+    percentage                # DecimalField, null=True
+    fixed_amount              # DecimalField, null=True
+    due_days_from_enrollment  # PositiveIntegerField, null=True
+    order                     # PositiveIntegerField
+    # Constraints (enforced in use case):
+    # - Exactly one of percentage or fixed_amount must be set
+    # - Sum of all percentages for a schedule must equal 100
+
+
+class LedgerInstalment(models.Model):
+    id                    # UUID, PK
+    ledger                # FK → FeeLedger
+    schedule_instalment   # FK → ScheduleInstalment, null=True
+                          # null = manually created outside a schedule
+    label                 # CharField — snapshot
+    due_date              # DateField — computed from enrollment date + due_days
+    amount_due            # DecimalField — computed; recalculated on balance change
+    is_active             # BooleanField, default=True
+    created_at            # auto
+    updated_at            # auto
+```
+
+**Auto-assignment:** If a `FeeStructure` has a `FeeSchedule` with
+`is_default=True`, it is auto-assigned when the ledger is generated.
+
+**Per-student schedule override:** Admin can assign a different `FeeSchedule` to a specific student's ledger. Behaviour:
+- Existing `LedgerInstalment` rows are deleted and regenerated from the new schedule
+- Blocked if any `LedgerTransaction` of type `PAYMENT` already exists — admin must handle manually in that case
+- Concession-only transactions do not block override (no cash received yet)
+
+**Instalment recalculation on balance change:** When a `LedgerTransaction`
+of type `CONCESSION` or `ADDITIONAL_CHARGE` is posted, all unpaid `LedgerInstalment` rows are recalculated proportionally against the new net balance using the original percentage ratios from `ScheduleInstalment`.
+
+```python
+def recalculate_instalments(ledger):
+    """
+    Recalculate unpaid instalment amounts against current ledger balance.
+    Called after any CONCESSION or ADDITIONAL_CHARGE transaction is posted.
+    Paid instalments (where a PAYMENT >= amount_due has been received) are
+    never touched.
+    """
+    net_balance = ledger.balance  # accounts for all transactions
+    unpaid = ledger.instalments.filter(is_active=True, is_paid=False).order_by('order')
+    total_pct = sum(
+        i.schedule_instalment.percentage
+        for i in unpaid
+        if i.schedule_instalment and i.schedule_instalment.percentage
+    )
+    for instalment in unpaid:
+        if instalment.schedule_instalment and instalment.schedule_instalment.percentage:
+            share = instalment.schedule_instalment.percentage / total_pct
+            instalment.amount_due = net_balance * share
+            instalment.save(update_fields=['amount_due', 'updated_at'])
+```
+
+**Direction of recalculation:**
+- `CONCESSION` posted → net balance decreases → unpaid instalments reduce
+- `ADDITIONAL_CHARGE` posted → net balance increases → unpaid instalments increase to absorb the additional charge (e.g. late fee penalty distributed across remaining instalments)
+
+**Payments are against ledger balance — not individual instalments:**
+Payments hit the ledger total. Instalment rows serve as due-date markers and overdue indicators. Per-instalment payment allocation is deferred to Phase 2.
+
+**Status:** Planned
+
+---
+
+## ADR-037: Late fee is computed on demand — formally recorded as `ADDITIONAL_CHARGE`
+**Decision:** Late fees are not stored automatically by the system. They are computed at read time when a `LedgerInstalment` is overdue beyond the configured grace period. If admin chooses to formally raise the late fee against a student, it is recorded as a `LedgerTransaction` of type `ADDITIONAL_CHARGE`. Late fee settings live on `OrganizationSettings`.
+
+**Reason:** 
+- Automatically storing late fees as transactions would require a scheduled background job running daily — operationally fragile, harder to audit, and potentially surprising to admins. 
+- Computing on demand means the indicator is always accurate and reflects current settings without any stored state. 
+- The formal recording step is an explicit, deliberate admin action — consistent with how manual fee administration actually works in institutions.
+
+**Settings additions to `OrganizationSettings`:**
+```python
+late_fee_enabled        # BooleanField, default=False
+late_fee_type           # CharField, choices=[PERCENTAGE, FIXED], null=True
+late_fee_value          # DecimalField, null=True
+late_fee_grace_days     # PositiveIntegerField, default=0
+```
+
+**On-demand computation:**
+```python
+def compute_late_fee(instalment, settings):
+    if not settings.late_fee_enabled:
+        return Decimal(0)
+    grace_deadline = instalment.due_date + timedelta(
+        days=settings.late_fee_grace_days
+    )
+    if date.today() <= grace_deadline:
+        return Decimal(0)
+    if settings.late_fee_type == PERCENTAGE:
+        return instalment.amount_due * (settings.late_fee_value / 100)
+    return settings.late_fee_value
+```
+
+**UI behaviour:**
+- Overdue instalments are flagged visually in the ledger view with the computed late fee amount shown as an indicator.
+- Admin sees a "Raise Late Fee" action on the overdue instalment row.
+- Confirming posts a `LedgerTransaction` of type `ADDITIONAL_CHARGE` with `label="Late Fee"` and `amount=computed_late_fee`.
+- Once posted, the transaction appears in the ledger audit trail and increases the student's outstanding balance via the debit path in balance computation (see ADR-035).
+- Admin can also manually post an `ADDITIONAL_CHARGE` of any amount and label for non-standard penalty scenarios (e.g. library damage, exam re-sit fee).
+
+**Why `ADDITIONAL_CHARGE` and not a dedicated `LATE_FEE` type:**
+`ADDITIONAL_CHARGE` is intentionally generic — late fees, exam re-sit charges, equipment damage fees all share the same debit semantics. A dedicated `LATE_FEE` type would add specificity with no meaningful behavioral difference. The `label` field carries the human-readable distinction for reporting purposes.
+
+**Alternatives considered:**
+- Scheduled job auto-posting late fee transactions daily — rejected: fragile, surprising to admins, hard to audit.
+- Storing late fee as a `CONCESSION` with negative label — rejected: concessions are credits; a late fee is a debit. Semantically incorrect and architecturally inconsistent with ADR-034.
+
+**Status:** Planned
