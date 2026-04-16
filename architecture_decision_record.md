@@ -123,7 +123,7 @@ UniqueConstraint(
 **Note on FeeHead:** `FeeHead` uses `on_delete=SET_NULL` on the
 `LedgerEntry.fee_head` FK — meaning the FK is nulled if the head is hard deleted at the DB level. However soft delete is enforced in the use case before this is ever reached. The `SET_NULL` is a safety net only.
 
-**Status:** Implemented (academic domain) / Planned (fees domain)
+**Status:** Implemented
 
 ---
 
@@ -418,7 +418,7 @@ The palette is still valuable — it accelerates the known-item workflow for pow
 **Decision:** All fee-related models (FeeStructure, FeeHead, FeeSchedule, ScheduleInstalment, FeeStructureIntake, FeeLedger, LedgerEntry, LedgerInstalment, LedgerTransaction) live in a dedicated fees/ app.
 **Reason:** Fees are a financially distinct domain-independent lifecycle, separate reporting, future payment gateway integration. Coupling to enrollments/ or students/ would create a bloated app with mixed concerns. A separate app allows the fees domain to grow (invoicing, gateway, receipts) without touching academic models.
 Alternatives considered: Extending enrollments/ app with fee models.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -436,7 +436,7 @@ class FeeStructure(models.Model):
     updated_at      auto
 ```
 **Alternatives considered:** FK from FeeStructure to Program with nullable Intake override — rejected because it creates an unnecessary program-level fallback that becomes stale and is always overridden in practice.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -466,7 +466,7 @@ class FeeStructureIntake(models.Model):
         ]
 ```
 **Replacing a structure on an intake:** Use case deactivates the existing assignment and creates a new one atomically. Blocked if ledgers already exist for that intake.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -489,7 +489,7 @@ class FeeHead(models.Model):
     updated_at      auto
 ```
 **Phase 2 note:** period_label will gain a nullable FK to IntakePeriod when that model is introduced. Existing heads with period_label set and intake_period=null remain valid as unassigned charges.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -534,7 +534,7 @@ if structure:
 **Reason:** Auto-generation is the correct default once the system is live.
 The manual bulk trigger handles the bootstrapping problem — institutions onboarding with students already enrolled before any fee structure was configured. Once live, the manual trigger becomes a rarely used safety net.
 
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -555,7 +555,7 @@ class LedgerEntry(models.Model):
     updated_at      auto
 ```
 `fee_head` FK is nullable (`on_delete=SET_NULL`) — if a head is soft deleted, the ledger entry remains intact with its snapshot values. The financial record is never orphaned.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -641,7 +641,7 @@ def balance(self):
 - Separate `Concession` and `Payment` models — rejected: splits audit trail, complicates balance computation, two queries with different semantics.
 - `Concession` model with negative amounts for penalties — rejected: semantically incorrect, concessions are credits and cannot represent debits.
 
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -736,7 +736,7 @@ def recalculate_instalments(ledger):
 **Payments are against ledger balance — not individual instalments:**
 Payments hit the ledger total. Instalment rows serve as due-date markers and overdue indicators. Per-instalment payment allocation is deferred to Phase 2.
 
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -785,4 +785,4 @@ def compute_late_fee(instalment, settings):
 - Scheduled job auto-posting late fee transactions daily — rejected: fragile, surprising to admins, hard to audit.
 - Storing late fee as a `CONCESSION` with negative label — rejected: concessions are credits; a late fee is a debit. Semantically incorrect and architecturally inconsistent with ADR-034.
 
-**Status:** Planned
+**Status:** Implemented

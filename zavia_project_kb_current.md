@@ -222,6 +222,10 @@ Permission classes used across views:
 - organization                  OneToOneField → Organization
 - terms_enabled                 BooleanField, default=True
 - allow_multiple_enrollments    BooleanField, default=False
+- late_fee_enabled              BooleanField, default=False
+- late_fee_type                 CharField, choices=[PERCENTAGE, FIXED], null=True
+- late_fee_value                DecimalField(max_digits=10, decimal_places=2), null=True
+- late_fee_grace_days           PositiveIntegerField, default=0
 - created_at                    auto
 - updated_at                    auto
 ```
@@ -519,9 +523,18 @@ Organization
   │     │     │     └── CurriculumEntry (unassigned — curriculum_level=null)
   │     │     └── Intake ──→ CurriculumVersion
   │     └── Course (owned by this department)
-  └── Student
-        └── Enrollment ──→ Program
-                       ──→ Intake (optional)
+  ├── Student
+  │     └── Enrollment ──→ Program
+  │                    ──→ Intake (optional)
+  │                    ──→ FeeLedger (1:1, auto-created on enrollment)
+  │                          ├── LedgerEntry     (snapshot of fee heads at enrollment time)
+  │                          ├── LedgerInstalment (materialised from default schedule)
+  │                          └── LedgerTransaction (payments, concessions, additional charges)
+  └── FeeStructure
+        ├── FeeHead (line items — name, amount, period_label)
+        ├── FeeSchedule (instalment templates)
+        │     └── ScheduleInstalment (percentage or fixed_amount per instalment)
+        └── FeeStructureIntake ──→ Intake  (junction: one active structure per intake)
 ```
 
 **Key relationship note:** A `Course` is owned by one `Department` (via FK). It can be included in any `Program`'s curriculum via `CurriculumEntry` regardless of which department owns the program. Ownership ≠ usage.
@@ -645,6 +658,39 @@ DELETE /api/v1/org/{slug}/members/{id}/
 # Organization Settings
 GET    /api/v1/org/{slug}/settings/
 PATCH  /api/v1/org/{slug}/settings/
+
+# Fees — Structure layer
+GET    /api/v1/orgs/{slug}/fees/structures/
+POST   /api/v1/orgs/{slug}/fees/structures/
+GET    /api/v1/orgs/{slug}/fees/structures/{id}/
+PATCH  /api/v1/orgs/{slug}/fees/structures/{id}/
+DELETE /api/v1/orgs/{slug}/fees/structures/{id}/
+GET    /api/v1/orgs/{slug}/fees/structures/{id}/heads/
+POST   /api/v1/orgs/{slug}/fees/structures/{id}/heads/
+PATCH  /api/v1/orgs/{slug}/fees/structures/{id}/heads/{id}/
+DELETE /api/v1/orgs/{slug}/fees/structures/{id}/heads/{id}/
+GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
+POST   /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
+GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
+DELETE /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
+POST   /api/v1/orgs/{slug}/fees/structures/{id}/assign-intake/
+DELETE /api/v1/orgs/{slug}/fees/structures/{id}/assign-intake/
+
+# Fees — Ledger layer
+GET    /api/v1/orgs/{slug}/fees/ledgers/              ?enrollment=  ?student=  ?has_balance=
+GET    /api/v1/orgs/{slug}/fees/ledgers/{id}/
+POST   /api/v1/orgs/{slug}/fees/ledgers/{id}/transactions/
+DELETE /api/v1/orgs/{slug}/fees/ledgers/transactions/{id}/
+POST   /api/v1/orgs/{slug}/fees/ledgers/{id}/assign-schedule/
+POST   /api/v1/orgs/{slug}/fees/intakes/{id}/generate-ledgers/
+
+# Fees — Reporting
+GET    /api/v1/orgs/{slug}/fees/summary/
+GET    /api/v1/orgs/{slug}/fees/summary/intakes/{id}/
+
+# Fees — Student / Enrollment shortcuts
+GET    /api/v1/orgs/{slug}/students/{id}/ledger/
+GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 ```
 
 ---
@@ -681,6 +727,15 @@ PATCH  /api/v1/org/{slug}/settings/
 | 26 | `CurriculumLevel` as a first-class model | Integer `level` field was implicit — no naming, no ordering guarantee, no metadata. A dedicated model allows free-text naming per level and explicit ordering independent of name |
 | 27 | Two intake endpoints (nested + flat) | The program detail page uses the nested endpoint (scoped to one program). The standalone intakes list page needs the flat org-scoped endpoint to show all intakes across all programs with cross-program filtering |
 | 28 | Duration stored as total months (integer) | Eliminates `duration_unit` field from Program model. Frontend decomposes into years + months for display and editing. Simpler comparisons and sorting. |
+| 29 | `fees/` as a separate Django app | Fees are a financially distinct domain with independent lifecycle, reporting, and future payment gateway integration — coupling to `enrollments/` or `students/` would create mixed concerns |
+| 30 | `FeeStructure` is a standalone org-scoped template | No FK to Program or Intake — assigned to intakes via junction model. Allows one structure to be reused across multiple intakes with identical fees without duplication |
+| 31 | `FeeStructureIntake` junction model — one active structure per intake | M2M between FeeStructure and Intake; partial unique constraint ensures at most one active structure assignment per intake at any time |
+| 32 | `FeeHead` locked after first `LedgerEntry` references it | Coarser structure-level lock would block legitimate additions (e.g. Semester 2 fees after Semester 1 ledgers exist). Per-head lock at the right granularity; new heads always propagate to existing ledgers in `transaction.atomic()` |
+| 33 | Ledger auto-generated on enrollment; manual bulk endpoint for pre-existing | Empty `FeeLedger` always created even with no fee structure — enrollment is never blocked by fee config. Bulk endpoint (`POST .../intakes/{id}/generate-ledgers/`) handles onboarding migrations; idempotent |
+| 34 | `LedgerEntry` stores snapshot fields — never mutated | `head_name` and `charged_amount` are copied at generation time. Subsequent `FeeHead` edits cannot retroactively change a student's established fee obligation — accounting principle + compliance requirement |
+| 35 | `LedgerTransaction` unifies all post-generation ledger movements | Payments, concessions, additional charges, and reversals are all transaction records distinguished by `transaction_type`. Unified audit trail; balance computed as `total_charged + debits − credits` |
+| 36 | Instalment schedule is a template — materialised per ledger | `FeeSchedule`/`ScheduleInstalment` are structure-level templates. `LedgerInstalment` is the per-student materialised copy. Unpaid instalments recalculate proportionally when concession or additional charge is posted |
+| 37 | Late fee computed on demand; raised as `ADDITIONAL_CHARGE` | Auto-posting via scheduled job is fragile and surprising. Late fee shown as an indicator on overdue instalments; admin raises it explicitly as a transaction. Settings (`late_fee_enabled`, `late_fee_type`, `late_fee_value`, `late_fee_grace_days`) live on `OrganizationSettings` |
 
 ---
 
@@ -699,6 +754,7 @@ PATCH  /api/v1/org/{slug}/settings/
 | `curriculum/` | ✅ | ✅ | ✅ | Complete |
 | `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters |
 | `enrollments/` | ✅ | ✅ | ✅ | Complete |
+| `fees/` | ✅ | ✅ | ✅ | Complete |
 
 ### Frontend
 
@@ -726,7 +782,7 @@ Core academic back-office for institution administrators.
 - ✅ Academic structure backend (Departments → Programs → Curriculum → Courses → Intakes → Enrollments)
 - ✅ Frontend — Departments, Courses, Programs, Curriculum builder, Intakes
 - ✅ Enrollments frontend
-- ⬜ Fee tracking / Payments
+- ✅ Fee tracking / Payments
 
 ### Phase 2 — Academic Operations
 - Academic grading
