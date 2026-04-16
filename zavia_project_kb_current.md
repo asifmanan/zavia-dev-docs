@@ -713,7 +713,7 @@ PATCH  /api/v1/org/{slug}/settings/
 | Programs — list (responsive table), detail page (overview + curriculum + intakes tabs) | ✅ Complete |
 | Curriculum builder | ✅ Complete |
 | Intakes — list page (search, program/status filter), detail page, intakes tab on program | ✅ Complete |
-| Enrollments | ⬜ To Do |
+| Enrollments | ✅ Complete |
 
 ---
 
@@ -725,7 +725,7 @@ Core academic back-office for institution administrators.
 - ✅ Student registry
 - ✅ Academic structure backend (Departments → Programs → Curriculum → Courses → Intakes → Enrollments)
 - ✅ Frontend — Departments, Courses, Programs, Curriculum builder, Intakes
-- ⬜ Enrollments frontend
+- ✅ Enrollments frontend
 - ⬜ Fee tracking / Payments
 
 ### Phase 2 — Academic Operations
