@@ -142,12 +142,12 @@ Every tenant is an **Organization**. All domain data is scoped to it.
 
 **Backend routing**
 ```
-/api/v1/org/{slug}/students/
-/api/v1/org/{slug}/departments/
-/api/v1/org/{slug}/courses/
-/api/v1/org/{slug}/programs/
-/api/v1/org/{slug}/intakes/
-/api/v1/org/{slug}/enrollments/
+/api/v1/orgs/{slug}/students/
+/api/v1/orgs/{slug}/departments/
+/api/v1/orgs/{slug}/courses/
+/api/v1/orgs/{slug}/programs/
+/api/v1/orgs/{slug}/intakes/
+/api/v1/orgs/{slug}/enrollments/
 ```
 
 **Tenant isolation**
@@ -179,6 +179,7 @@ Represents tenant institutions.
 ```
 - id              UUID, PK
 - display_name    CharField  ← the institution's human-readable name
+- legal_name      CharField, blank=True  ← optional full legal name
 - slug            SlugField, unique
 - created_by      FK → User
 - is_active       BooleanField, default=True
@@ -259,21 +260,38 @@ Student registry within an organization.
 
 **`Student` model**
 ```
-- id            UUID, PK
-- organization  FK → Organization
-- student_id    CharField (YYMM-SEQ format, e.g. 2506-0001)
-- first_name    CharField
-- last_name     CharField
-- gender        CharField
-- date_of_birth DateField
-- is_active     BooleanField, default=True
-- created_at    auto
-- updated_at    auto
+- id                            UUID, PK
+- organization                  FK → Organization
+- student_id                    CharField(8), editable=False
+- first_name                    CharField
+- last_name                     CharField
+- gender                        CharField, choices=[MALE, FEMALE, OTHER, PREFER_NOT_TO_SAY], optional
+- application_reference_number  CharField, optional
+- phone                         CharField, optional
+- address                       TextField, optional
+- date_of_birth                 DateField, optional
+- guardian_name                 CharField, optional
+- id_document_type              CharField, choices=[PASSPORT, NATIONAL_ID, DRIVING_LICENSE], optional
+- id_document_number            CharField, optional
+- is_active                     BooleanField, default=True
+- marked_for_deletion_at        DateTimeField, optional  ← set when queued for GDPR erasure
+- erased_at                     DateTimeField, optional  ← set when personal data is erased
+- erased_by                     FK → User, optional, SET_NULL
+- created_at                    auto
+- updated_at                    auto
 ```
 
-**Student ID format:** `YYMM` + zero-padded sequence per org per month (e.g. `2506-0001`, `2506-0002`). Generated in use case on create.
+**`StudentIdCounter` model** — internal sequence tracker, not exposed via API:
+```
+- organization  FK → Organization
+- yymm          CharField(4)  ← e.g. "2604" for April 2026
+- last_seq      PositiveIntegerField, default=0
+```
+Constraint: `UniqueConstraint(organization, yymm)`
 
-**Implemented:** create, retrieve, update, list, soft delete, dependency check before delete
+**Student ID format:** `YYMM` + zero-padded 4-digit sequence per org per month (e.g. `26040001`). Incremented with `SELECT FOR UPDATE` inside `transaction.atomic()` via `students/services.py:generate_next_student_id`. Max 9999 per org per month.
+
+**Implemented:** create, retrieve, update, list, soft delete, dependency check before delete, external ID types, student external IDs
 
 **Business logic in:** `students/use_cases/`
 
@@ -345,7 +363,8 @@ Top-level academic offering of an institution (what institutions call "courses" 
 - name              CharField, required
 - code              CharField, optional
 - description       TextField, optional
-- duration          PositiveIntegerField, optional (stored as total months)
+- duration          PositiveIntegerField, optional
+- duration_unit     CharField, choices=[MONTHS, YEARS, DAYS, HOURS], default=MONTHS, optional
 - program_type      CharField, choices=[STANDARD, SHORT]
 - program_level     CharField, choices=[UNDERGRADUATE, POSTGRADUATE, DOCTORATE, DIPLOMA, CERTIFICATE, VOCATIONAL, OTHER], optional
 - is_active         BooleanField, default=True
@@ -585,88 +604,108 @@ UniqueConstraint(fields=['organization', 'code'], condition=Q(code__isnull=False
 
 ## 7. API Design
 
-**Base pattern:** `/api/v1/org/{slug}/resource/`
+**Base pattern:** `/api/v1/orgs/{slug}/resource/`
 
 ```
 # Students
-GET    /api/v1/org/{slug}/students/
-POST   /api/v1/org/{slug}/students/
-GET    /api/v1/org/{slug}/students/{id}/
-PATCH  /api/v1/org/{slug}/students/{id}/
-DELETE /api/v1/org/{slug}/students/{id}/
+GET    /api/v1/orgs/{slug}/students/
+POST   /api/v1/orgs/{slug}/students/
+GET    /api/v1/orgs/{slug}/students/{id}/
+PATCH  /api/v1/orgs/{slug}/students/{id}/
+DELETE /api/v1/orgs/{slug}/students/{id}/
+
+# Student External ID Types (org-level config)
+GET    /api/v1/orgs/{slug}/students/id-types/
+POST   /api/v1/orgs/{slug}/students/id-types/
+GET    /api/v1/orgs/{slug}/students/id-types/{id}/
+PATCH  /api/v1/orgs/{slug}/students/id-types/{id}/
+DELETE /api/v1/orgs/{slug}/students/id-types/{id}/
+
+# Student External IDs (per student)
+GET    /api/v1/orgs/{slug}/students/{student_id}/external-ids/
+POST   /api/v1/orgs/{slug}/students/{student_id}/external-ids/
+PATCH  /api/v1/orgs/{slug}/students/{student_id}/external-ids/{id}/
+DELETE /api/v1/orgs/{slug}/students/{student_id}/external-ids/{id}/
 
 # Departments
-GET    /api/v1/org/{slug}/departments/
-POST   /api/v1/org/{slug}/departments/
-GET    /api/v1/org/{slug}/departments/{id}/
-PATCH  /api/v1/org/{slug}/departments/{id}/
-DELETE /api/v1/org/{slug}/departments/{id}/
+GET    /api/v1/orgs/{slug}/departments/
+POST   /api/v1/orgs/{slug}/departments/
+GET    /api/v1/orgs/{slug}/departments/{id}/
+PATCH  /api/v1/orgs/{slug}/departments/{id}/
+DELETE /api/v1/orgs/{slug}/departments/{id}/
 
 # Courses
-GET    /api/v1/org/{slug}/courses/
-POST   /api/v1/org/{slug}/courses/
-GET    /api/v1/org/{slug}/courses/{id}/
-PATCH  /api/v1/org/{slug}/courses/{id}/
-DELETE /api/v1/org/{slug}/courses/{id}/
+GET    /api/v1/orgs/{slug}/courses/
+POST   /api/v1/orgs/{slug}/courses/
+GET    /api/v1/orgs/{slug}/courses/{id}/
+PATCH  /api/v1/orgs/{slug}/courses/{id}/
+DELETE /api/v1/orgs/{slug}/courses/{id}/
 
 # Programs
-GET    /api/v1/org/{slug}/programs/
-POST   /api/v1/org/{slug}/programs/
-GET    /api/v1/org/{slug}/programs/{id}/
-PATCH  /api/v1/org/{slug}/programs/{id}/
-DELETE /api/v1/org/{slug}/programs/{id}/
+GET    /api/v1/orgs/{slug}/programs/
+POST   /api/v1/orgs/{slug}/programs/
+GET    /api/v1/orgs/{slug}/programs/{id}/
+PATCH  /api/v1/orgs/{slug}/programs/{id}/
+DELETE /api/v1/orgs/{slug}/programs/{id}/
 
 # Curriculum Versions (nested under program)
-GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/
-POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/
-GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/
-PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/
-DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/
-POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{id}/set-default/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/curriculum/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/curriculum/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{id}/
+PATCH  /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{id}/
+DELETE /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{id}/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{id}/set-default/
 
 # Curriculum Levels (nested under version)
-GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
-POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
-PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
-DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
-POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/levels/reorder/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/levels/
+PATCH  /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
+DELETE /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/levels/{id}/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/levels/reorder/
 
 # Curriculum Entries (nested under version)
-GET    /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
-POST   /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
-PATCH  /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
-DELETE /api/v1/org/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/entries/
+PATCH  /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
+DELETE /api/v1/orgs/{slug}/programs/{program_id}/curriculum/{version_id}/entries/{id}/
 
 # Intakes — nested (program-scoped)
-GET    /api/v1/org/{slug}/programs/{program_id}/terms/
-POST   /api/v1/org/{slug}/programs/{program_id}/terms/
-GET    /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
-PATCH  /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
-DELETE /api/v1/org/{slug}/programs/{program_id}/terms/{id}/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/terms/
+POST   /api/v1/orgs/{slug}/programs/{program_id}/terms/
+GET    /api/v1/orgs/{slug}/programs/{program_id}/terms/{id}/
+PATCH  /api/v1/orgs/{slug}/programs/{program_id}/terms/{id}/
+DELETE /api/v1/orgs/{slug}/programs/{program_id}/terms/{id}/
 
 # Intakes — flat (org-scoped)
-GET    /api/v1/org/{slug}/intakes/              ?search=  ?program=  ?status=
-POST   /api/v1/org/{slug}/intakes/
-GET    /api/v1/org/{slug}/intakes/{id}/
-PATCH  /api/v1/org/{slug}/intakes/{id}/
-DELETE /api/v1/org/{slug}/intakes/{id}/
+GET    /api/v1/orgs/{slug}/intakes/              ?search=  ?program=  ?status=
+POST   /api/v1/orgs/{slug}/intakes/
+GET    /api/v1/orgs/{slug}/intakes/{id}/
+PATCH  /api/v1/orgs/{slug}/intakes/{id}/
+DELETE /api/v1/orgs/{slug}/intakes/{id}/
 
 # Enrollments
-GET    /api/v1/org/{slug}/enrollments/
-POST   /api/v1/org/{slug}/enrollments/
-GET    /api/v1/org/{slug}/enrollments/{id}/
-PATCH  /api/v1/org/{slug}/enrollments/{id}/
-DELETE /api/v1/org/{slug}/enrollments/{id}/
+GET    /api/v1/orgs/{slug}/enrollments/
+POST   /api/v1/orgs/{slug}/enrollments/
+GET    /api/v1/orgs/{slug}/enrollments/{id}/
+PATCH  /api/v1/orgs/{slug}/enrollments/{id}/status/  ← status transition only
+DELETE /api/v1/orgs/{slug}/enrollments/{id}/delete/  ← soft delete
 
 # Membership
-GET    /api/v1/org/{slug}/members/
-POST   /api/v1/org/{slug}/members/
-PATCH  /api/v1/org/{slug}/members/{id}/
-DELETE /api/v1/org/{slug}/members/{id}/
+GET    /api/v1/orgs/{slug}/members/
+POST   /api/v1/orgs/{slug}/members/
+PATCH  /api/v1/orgs/{slug}/members/{id}/
+DELETE /api/v1/orgs/{slug}/members/{id}/
 
 # Organization Settings
-GET    /api/v1/org/{slug}/settings/
-PATCH  /api/v1/org/{slug}/settings/
+GET    /api/v1/orgs/{slug}/settings/
+PATCH  /api/v1/orgs/{slug}/settings/
+
+# Tax
+GET    /api/v1/orgs/{slug}/tax/rates/
+POST   /api/v1/orgs/{slug}/tax/rates/
+GET    /api/v1/orgs/{slug}/tax/rates/{id}/
+PATCH  /api/v1/orgs/{slug}/tax/rates/{id}/
+DELETE /api/v1/orgs/{slug}/tax/rates/{id}/
 
 # Fees — Structure layer
 GET    /api/v1/orgs/{slug}/fees/structures/
@@ -681,16 +720,17 @@ DELETE /api/v1/orgs/{slug}/fees/structures/{id}/heads/{id}/
 GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
 POST   /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
 GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
-DELETE /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
+PATCH  /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
 POST   /api/v1/orgs/{slug}/fees/structures/{id}/clone/
 
 # Fees — Ledger layer
 GET    /api/v1/orgs/{slug}/fees/ledgers/              ?enrollment=  ?student=  ?has_balance=
 GET    /api/v1/orgs/{slug}/fees/ledgers/{id}/
+GET    /api/v1/orgs/{slug}/fees/ledgers/{id}/transactions/
 POST   /api/v1/orgs/{slug}/fees/ledgers/{id}/transactions/
 DELETE /api/v1/orgs/{slug}/fees/ledgers/transactions/{id}/
 POST   /api/v1/orgs/{slug}/fees/ledgers/{id}/assign-schedule/
-POST   /api/v1/orgs/{slug}/fees/intakes/{id}/generate-ledgers/
+POST   /api/v1/orgs/{slug}/fees/intakes/{intake_id}/generate-ledgers/
 
 # Fees — Reporting
 GET    /api/v1/orgs/{slug}/fees/summary/
@@ -734,9 +774,9 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | 25 | Course-level enrollment tracking deferred to Phase 2 | MVP need is replacing a manual admission register. Course-level outcome tracking is a transcript feature not yet required by the client |
 | 26 | `CurriculumLevel` as a first-class model | Integer `level` field was implicit — no naming, no ordering guarantee, no metadata. A dedicated model allows free-text naming per level and explicit ordering independent of name |
 | 27 | Two intake endpoints (nested + flat) | The program detail page uses the nested endpoint (scoped to one program). The standalone intakes list page needs the flat org-scoped endpoint to show all intakes across all programs with cross-program filtering |
-| 28 | Duration stored as total months (integer) | Eliminates `duration_unit` field from Program model. Frontend decomposes into years + months for display and editing. Simpler comparisons and sorting. |
+| 28 | `duration` and `duration_unit` on Program | Duration stored as a numeric value with an explicit `duration_unit` field (choices: MONTHS, YEARS, DAYS, HOURS, default: MONTHS). Supports institutions that specify duration in years, days, or hours. |
 | 29 | `fees/` as a separate Django app | Fees are a financially distinct domain with independent lifecycle, reporting, and future payment gateway integration — coupling to `enrollments/` or `students/` would create mixed concerns |
-| 30 | `FeeStructure` is a standalone org-scoped template | No FK to Program or Intake — assigned to intakes via junction model. Allows one structure to be reused across multiple intakes with identical fees without duplication |
+| 30 | `FeeStructure` — template and intake-bound clone design | `FeeStructure` has a direct `intake` FK (null = reusable template, set = intake-bound clone). `clone_structure_for_intake` creates an independent per-intake copy. `source_template` self-FK preserves clone lineage. Junction model (`FeeStructureIntake`) removed. |
 | 31 | One active fee structure per intake — constraint on `FeeStructure` directly | `FeeStructureIntake` junction removed; partial unique index on `(organization, intake)` where `intake IS NOT NULL AND is_active` enforces the one-active-structure guarantee directly on the cloned row |
 | 32 | `FeeHead` locked after first `LedgerEntry` references it | Coarser structure-level lock would block legitimate additions (e.g. Semester 2 fees after Semester 1 ledgers exist). Per-head lock at the right granularity; new heads always propagate to existing ledgers in `transaction.atomic()` |
 | 33 | Ledger auto-generated on enrollment; manual bulk endpoint for pre-existing | Empty `FeeLedger` always created even with no fee structure — enrollment is never blocked by fee config. Bulk endpoint (`POST .../intakes/{id}/generate-ledgers/`) handles onboarding migrations; idempotent |
@@ -766,7 +806,7 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters |
 | `enrollments/` | ✅ | ✅ | ✅ | Complete |
 | `fees/` | ✅ | ✅ | ✅ | Complete |
-| `tax/` | ✅ | n/a | n/a | Complete — TaxRate model only |
+| `tax/` | ✅ | ✅ | ✅ | Complete — TaxRate CRUD with lock enforcement |
 
 ### Frontend
 

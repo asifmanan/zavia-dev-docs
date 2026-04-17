@@ -119,6 +119,10 @@ UniqueConstraint(
 - FeeSchedule delete → blocked if any `FeeLedger` references it (schedule has been materialised into instalment rows)
 - FeeLedger delete → blocked if any `LedgerTransaction` exists against it (financial movements have been recorded — ledger is part of audit trail)
 
+**Dependency checks — Tax domain (added):**
+- TaxRate delete → blocked if any active `FeeHead` references it OR if any `LedgerEntry` references it via `fee_head__tax_rate` (rate has been applied to a student ledger)
+- TaxRate update (name or rate) → blocked if any `LedgerEntry` references it via `fee_head__tax_rate` (rate is locked once applied to any ledger — `is_locked=True`); create a new TaxRate instead
+
 **Reason:** Hard deletes are irreversible. Deleting a record with active dependencies would orphan related data and break reporting. For financial records specifically, deletion after any transaction has been posted is an accounting integrity violation — the audit trail must remain intact.
 
 **Note on FeeHead:** `FeeHead` uses `on_delete=SET_NULL` on the
@@ -144,7 +148,7 @@ UniqueConstraint(
 ---
 
 ## ADR-016: `program_level` field on Program
-**Decision:** `Program` has an optional `program_level` field with choices: UNDERGRADUATE, POSTGRADUATE, DIPLOMA, CERTIFICATE, VOCATIONAL, OTHER.
+**Decision:** `Program` has an optional `program_level` field with choices: UNDERGRADUATE, POSTGRADUATE, DOCTORATE, DIPLOMA, CERTIFICATE, VOCATIONAL, OTHER.
 **Reason:** Institutions classify programs by academic level for reporting and display. Using level descriptors (not degree names like BS/MS) keeps it institution and country neutral.
 **Note:** `SHORT` was deliberately excluded from `program_level` — it belongs to `program_type`, not academic level hierarchy.
 **Status:** Implemented
@@ -210,7 +214,7 @@ Frontend types and display labels updated.
 - `ExternalIdType` — org-level configuration (name, description, is_required)
 - `StudentExternalId` — per-student assignment (id_type FK, value)
 **Uniqueness:** No two students in the same org can have the same value for the same ID type.
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -221,7 +225,7 @@ Frontend types and display labels updated.
 - UI flags missing required IDs as warnings
 - Admin dashboard shows students with missing required IDs
 - No hard enforcement anywhere in the system
-**Status:** Planned
+**Status:** Implemented
 
 ---
 
@@ -523,16 +527,21 @@ def _resolve_fee_structure(intake, organization):
 enrollment = Enrollment(...)
 enrollment.save()
 
+structure = _resolve_fee_structure(enrollment.intake, organization)
+
 ledger = FeeLedger.objects.create(
     organization=organization,
     student=student,
     enrollment=enrollment,
+    structure=structure,   # FK → FeeStructure; null if no structure assigned yet
+    schedule=None,         # FK → FeeSchedule; set after default schedule is resolved
 )
 
-structure = _resolve_fee_structure(enrollment.intake, organization)
 if structure:
     generate_ledger_entries(ledger=ledger, structure=structure)
     assign_default_schedule(ledger=ledger, structure=structure)
+    # assign_default_schedule sets ledger.schedule = default_schedule and calls
+    # ledger.save(update_fields=['schedule', 'updated_at'])
 ```
 
 **Manual bulk trigger behaviour:**
@@ -555,11 +564,17 @@ The manual bulk trigger handles the bootstrapping problem — institutions onboa
 ```python
 class LedgerEntry(models.Model):
     id              UUID, PK
+    organization    FK → Organization
     ledger          FK → FeeLedger
     fee_head        FK → FeeHead, null=True, on_delete=SET_NULL
     head_name       CharField       # snapshot
     charged_amount  DecimalField    # snapshot — never mutated
     period_label    CharField, null=True  # snapshot of FeeHead.period_label
+    is_taxable      BooleanField, default=False
+    tax_rate_snapshot  DecimalField, null=True  # see ADR-039
+    tax_amount      DecimalField, default=0.00  # see ADR-039
+    gross_amount    DecimalField, default=0.00  # see ADR-039
+    order           PositiveIntegerField, default=0  # snapshot of FeeHead.order
     is_active       BooleanField, default=True
     created_at      auto
     updated_at      auto
@@ -682,6 +697,7 @@ class FeeSchedule(models.Model):
 
 class ScheduleInstalment(models.Model):
     id                        # UUID, PK
+    organization              # FK → Organization
     schedule                  # FK → FeeSchedule
     label                     # CharField — e.g. "Upon Admission", "Instalment 2"
     percentage                # DecimalField, null=True
@@ -695,6 +711,7 @@ class ScheduleInstalment(models.Model):
 
 class LedgerInstalment(models.Model):
     id                    # UUID, PK
+    organization          # FK → Organization
     ledger                # FK → FeeLedger
     schedule_instalment   # FK → ScheduleInstalment, null=True
                           # null = manually created outside a schedule
@@ -722,21 +739,42 @@ def recalculate_instalments(ledger):
     """
     Recalculate unpaid instalment amounts against current ledger balance.
     Called after any CONCESSION or ADDITIONAL_CHARGE transaction is posted.
-    Paid instalments (where a PAYMENT >= amount_due has been received) are
-    never touched.
+    "Unpaid" is determined by walking instalments in due_date order and
+    subtracting cumulative PAYMENT transactions — instalments fully covered
+    by payments are skipped; the remainder are recalculated.
     """
-    net_balance = ledger.balance  # accounts for all transactions
-    unpaid = ledger.instalments.filter(is_active=True, is_paid=False).order_by('order')
-    total_pct = sum(
-        i.schedule_instalment.percentage
-        for i in unpaid
-        if i.schedule_instalment and i.schedule_instalment.percentage
+    total_paid = sum(
+        LedgerTransaction.objects.filter(
+            ledger=ledger,
+            transaction_type=PAYMENT,
+            is_active=True,
+        ).values_list('amount', flat=True),
+        Decimal('0.00'),
     )
-    for instalment in unpaid:
-        if instalment.schedule_instalment and instalment.schedule_instalment.percentage:
-            share = instalment.schedule_instalment.percentage / total_pct
-            instalment.amount_due = net_balance * share
-            instalment.save(update_fields=['amount_due', 'updated_at'])
+    all_instalments = LedgerInstalment.objects.filter(
+        ledger=ledger, is_active=True,
+    ).order_by('due_date').select_related('schedule_instalment')
+
+    unpaid = []
+    for inst in all_instalments:
+        if total_paid >= inst.amount_due:
+            total_paid -= inst.amount_due
+        else:
+            unpaid.append(inst)
+
+    pct_unpaid = [
+        i for i in unpaid
+        if i.schedule_instalment and i.schedule_instalment.percentage
+    ]
+    if not pct_unpaid:
+        return
+
+    total_pct = sum(i.schedule_instalment.percentage for i in pct_unpaid)
+    net_balance = ledger.balance
+    for inst in pct_unpaid:
+        share = inst.schedule_instalment.percentage / total_pct
+        inst.amount_due = (net_balance * share).quantize(Decimal('0.01'))
+        inst.save(update_fields=['amount_due', 'updated_at'])
 ```
 
 **Direction of recalculation:**
@@ -1006,5 +1044,137 @@ const locale = navigator.language
 - Backend always stores and returns ISO 8601 (YYYY-MM-DD)
 - Frontend uses date_format setting for display only
 - No backend date formatting — purely a frontend hint
+
+**Status:** Implemented
+
+---
+
+## ADR-041: `tax/` API — CRUD with lock enforcement
+
+**Decision:** The `tax/` app exposes full CRUD for `TaxRate` via four use cases in `tax/use_cases.py`. Once a rate has been applied to any student ledger it is **locked** — name and rate become immutable.
+
+**Lock detection:**
+```python
+locked = LedgerEntry.objects.filter(
+    fee_head__tax_rate=tax_rate,
+    is_active=True,
+).exists()
+```
+The `is_locked` field on the serializer is a `SerializerMethodField` calling `get_tax_rate_lock_status(tax_rate=obj)`. The frontend uses this to disable edit inputs.
+
+**Use cases:**
+- `create_tax_rate(*, organization, name, rate)` — normalises name, validates `0 < rate ≤ 100`, iexact duplicate check, saves.
+- `update_tax_rate(*, tax_rate, name=None, rate=None)` — checks lock; raises `ValidationError` if locked and name or rate provided; otherwise validates and saves.
+- `delete_tax_rate(*, tax_rate)` — blocked if active `FeeHead` references it OR any `LedgerEntry` references it; soft deletes.
+- `get_tax_rate_lock_status(*, tax_rate) → bool` — read-only, no transaction needed.
+
+**Computed serializer fields:**
+- `is_locked` — `True` if any active `LedgerEntry` references the rate
+- `fee_head_count` — count of active `FeeHead` records using this rate
+
+**Permissions:** GET → `IsOrgAffiliated`; PATCH/POST → `IsOrgAdminOrOwner`; DELETE → `IsOrgOwner`.
+
+**Status:** Implemented
+
+---
+
+## ADR-042: `StudentIdCounter` model and `YYMM`-sequence ID generation
+
+**Decision:** Student IDs are generated as an 8-character string `YYMMXXXX` (e.g. `26040001` = April 2026, sequence 1). A `StudentIdCounter` model tracks the last sequence number per org per month.
+
+**Model:**
+```python
+class StudentIdCounter(models.Model):
+    organization  FK → Organization
+    yymm          CharField(4)   # e.g. "2604"
+    last_seq      PositiveIntegerField, default=0
+    # UniqueConstraint(organization, yymm)
+```
+
+**Generation (`students/services.py:generate_next_student_id`):**
+```python
+def generate_next_student_id(organization):
+    # Must be called inside transaction.atomic()
+    yymm = timezone.now().strftime('%y%m')
+    counter = StudentIdCounter.objects.select_for_update().get(
+        organization=organization, yymm=yymm,
+    )  # created if missing; SELECT FOR UPDATE on existing
+    next_seq = counter.last_seq + 1
+    if next_seq > 9999:
+        raise ValueError('Monthly student ID sequence exceeded 9999.')
+    counter.last_seq = next_seq
+    counter.save(update_fields=['last_seq'])
+    return f'{yymm}{next_seq:04d}'
+```
+
+**Reason:** A DB-level sequence or `MAX(student_id) + 1` would produce gaps under concurrent inserts or rollbacks. `SELECT FOR UPDATE` on the counter row serialises ID allocation within a transaction, guaranteeing monotonic sequential IDs per org per month with no gaps from concurrent creation.
+
+**Status:** Implemented
+
+---
+
+## ADR-043: Student GDPR / data erasure fields
+
+**Decision:** The `Student` model carries three fields to support a right-to-erasure workflow:
+
+```python
+marked_for_deletion_at  DateTimeField, null=True  # queued for erasure
+erased_at               DateTimeField, null=True  # personal data erased
+erased_by               FK → User, null=True, SET_NULL  # who triggered erasure
+```
+
+**Reason:** GDPR (and equivalent regulations) require the ability to erase personal data on request while preserving the existence of financial and academic records (which may have separate legal retention periods). Soft delete (`is_active=False`) alone is insufficient — it hides the record from normal views but does not remove PII. The erasure fields provide an explicit two-stage workflow: first mark for deletion (review/grace period), then erase (overwrite PII fields). Academic and financial records that reference `student.id` remain intact; only the personal identifying data on the `Student` row itself is overwritten.
+
+**Note:** The erasure execution logic (overwriting name, DOB, phone, address, etc.) is not yet implemented — the fields are in place to support the workflow when the requirement is formalised.
+
+**Status:** Fields implemented; erasure execution deferred.
+
+---
+
+## ADR-044: `FeeLedger.structure` and `FeeLedger.schedule` FKs
+
+**Decision:** `FeeLedger` carries direct FKs to the `FeeStructure` and `FeeSchedule` that were used when the ledger was generated:
+
+```python
+structure  FK → FeeStructure, on_delete=SET_NULL, null=True
+schedule   FK → FeeSchedule,  on_delete=SET_NULL, null=True
+```
+
+**`structure`** is set at ledger creation time to the active intake-bound `FeeStructure` resolved for the enrollment's intake. Null if no structure was assigned at enrollment time.
+
+**`schedule`** is set after the default schedule is resolved and materialised into `LedgerInstalment` rows. Null if the structure had no default schedule.
+
+**Reason:** These FKs serve audit and operational purposes — they record which structure and schedule the ledger was generated from. This allows staff to see at a glance which fee configuration applies to a student's ledger and allows reporting to group ledgers by structure or schedule. `SET_NULL` (not `PROTECT`) is intentional — the financial record must survive if the source structure is later soft-deleted.
+
+**Status:** Implemented
+
+---
+
+## ADR-045: Enrollment status transitions — `VALID_TRANSITIONS` and `/status/` endpoint
+
+**Decision:** Enrollment status changes are handled by a dedicated `PATCH /{id}/status/` endpoint, separate from the main `/{id}/` resource endpoint. Allowed transitions are governed by a `VALID_TRANSITIONS` dict in the use case layer.
+
+**Transition map:**
+```python
+VALID_TRANSITIONS = {
+    'ACTIVE':    {'SUSPENDED', 'COMPLETED', 'WITHDRAWN'},
+    'SUSPENDED': {'ACTIVE', 'WITHDRAWN'},
+    'COMPLETED': set(),   # terminal
+    'WITHDRAWN': set(),   # terminal
+}
+```
+
+**Endpoints:**
+```
+GET    /api/v1/orgs/{slug}/enrollments/          # list
+POST   /api/v1/orgs/{slug}/enrollments/          # create
+GET    /api/v1/orgs/{slug}/enrollments/{id}/     # retrieve (read-only)
+PATCH  /api/v1/orgs/{slug}/enrollments/{id}/status/   # status transition only
+DELETE /api/v1/orgs/{slug}/enrollments/{id}/delete/   # soft delete
+```
+
+The main `/{id}/` endpoint is read-only (GET only). There is no general PATCH on enrollment fields — status is the only mutable field post-creation, and it is handled exclusively through `/status/`.
+
+**Reason:** A dedicated `/status/` sub-resource makes the intent explicit, enforces the state machine cleanly, and provides a natural hook for future audit logging and workflow triggers (e.g. triggering a ledger freeze on COMPLETED, or a reinstatement prompt on ACTIVE after SUSPENDED).
 
 **Status:** Implemented
