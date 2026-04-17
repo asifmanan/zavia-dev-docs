@@ -113,7 +113,8 @@ UniqueConstraint(
 - Course delete → blocked if active CurriculumEntries exist
 
 **Dependency checks — Fees domain (added):**
-- FeeStructure delete → blocked if any active `FeeStructureIntake` assignment exists
+- FeeStructure (template) delete → blocked if any active intake-bound clone exists (`source_template` back-reference active)
+- FeeStructure (intake-bound clone) delete → blocked if any `FeeLedger` references it
 - FeeHead delete → blocked if any `LedgerEntry` references it (snapshot exists — the charge has been raised against a student)
 - FeeSchedule delete → blocked if any `FeeLedger` references it (schedule has been materialised into instalment rows)
 - FeeLedger delete → blocked if any `LedgerTransaction` exists against it (financial movements have been recorded — ledger is part of audit trail)
@@ -415,57 +416,65 @@ The palette is still valuable — it accelerates the known-item workflow for pow
 ---
 
 ## ADR-029: fees/ as a separate Django app
-**Decision:** All fee-related models (FeeStructure, FeeHead, FeeSchedule, ScheduleInstalment, FeeStructureIntake, FeeLedger, LedgerEntry, LedgerInstalment, LedgerTransaction) live in a dedicated fees/ app.
+**Decision:** All fee-related models (FeeStructure, FeeHead, FeeSchedule, ScheduleInstalment, FeeLedger, LedgerEntry, LedgerInstalment, LedgerTransaction) live in a dedicated fees/ app.
 **Reason:** Fees are a financially distinct domain-independent lifecycle, separate reporting, future payment gateway integration. Coupling to enrollments/ or students/ would create a bloated app with mixed concerns. A separate app allows the fees domain to grow (invoicing, gateway, receipts) without touching academic models.
 Alternatives considered: Extending enrollments/ app with fee models.
 **Status:** Implemented
 
 ---
 
-## ADR-030: FeeStructure is a standalone org-scoped template
-**Decision:** FeeStructure has no FK to Program or Intake. It is a named org-scoped template assigned to intakes via a junction model (FeeStructureIntake).
-**Reason:** Fees change annually — a program-level default would be stale almost immediately and every intake would override it anyway, making program-level structure a redundant concept. A standalone template that can be assigned to one or multiple intakes is more honest. One well-designed structure (e.g. "Health Tech Fees 2026") can be reused across intakes with identical fees without duplication.
+## ADR-030: FeeStructure — template and intake-bound clone design
+**Decision:** FeeStructure has a direct `intake` FK (null = reusable template, set = intake-bound clone). The `FeeStructureIntake` junction model has been removed. A template is cloned to a target intake via `clone_structure_for_intake`, which creates a new FeeStructure with `intake=<target>` and `source_template=<original>`, copying all FeeHead and FeeSchedule/ScheduleInstalment records as independent copies.
+
+**Reason:** The original junction model design allowed one template to be assigned to multiple intakes simultaneously, but this created a dangerous shared-mutation problem: editing a FeeHead on a shared template would affect all assigned intakes including those with existing student ledgers. The revised model makes the relationship explicit — cloning creates a fully independent copy per intake. The `source_template` self-FK preserves lineage for audit and UI (e.g. "Cloned from Health Tech Fees 2026") without creating shared mutation risk. Template names are enforced unique per org (partial index, `intake IS NULL`); intake-bound clones carry no name constraint.
+
 **Model:**
-```
+```python
 class FeeStructure(models.Model):
-    id              UUID, PK
-    organization    FK → Organization
-    name            CharField
-    is_active       BooleanField, default=True
-    created_at      auto
-    updated_at      auto
-```
-**Alternatives considered:** FK from FeeStructure to Program with nullable Intake override — rejected because it creates an unnecessary program-level fallback that becomes stale and is always overridden in practice.
-**Status:** Implemented
-
----
-
-## ADR-031: FeeStructureIntake junction model — one active structure per intake
-**Decision:** FeeStructure and Intake are associated via a junction model FeeStructureIntake. A unique constraint enforces one active structure per intake.
-**Reason:** The relationship is genuinely M2M — one structure can apply to multiple intakes (e.g. fees unchanged for two consecutive intakes). A junction table is the honest representation. Uniqueness at the intake level is enforced to prevent ambiguity in ledger generation.
-**Model:**
-```
-class FeeStructureIntake(models.Model):
-    id              UUID, PK
-    fee_structure   FK → FeeStructure
-    intake          FK → Intake
-    is_active       BooleanField, default=True
-    created_at      auto
+    id               # UUID, PK
+    organization     # FK → Organization
+    intake           # FK → Intake, null=True, blank=True, on_delete=SET_NULL
+                     # null = reusable template
+                     # set  = intake-bound clone
+    source_template  # FK → self, null=True, blank=True, on_delete=SET_NULL
+                     # set on clones; null on manually created templates
+    name             # CharField
+    is_active        # BooleanField, default=True
+    created_at       # auto
+    updated_at       # auto
 
     class Meta:
         constraints = [
             UniqueConstraint(
-                fields=['fee_structure', 'intake'],
-                name='unique_structure_intake_pair'
+                fields=['organization', 'intake'],
+                condition=Q(intake__isnull=False, is_active=True),
+                name='unique_active_structure_per_intake'
             ),
             UniqueConstraint(
-                fields=['intake'],
-                condition=Q(is_active=True),
-                name='unique_active_structure_per_intake'
-            )
+                fields=['organization', 'name'],
+                condition=Q(intake__isnull=True, is_active=True),
+                name='unique_active_template_name_per_org'
+            ),
         ]
 ```
-**Replacing a structure on an intake:** Use case deactivates the existing assignment and creates a new one atomically. Blocked if ledgers already exist for that intake.
+**Alternatives considered:** Original junction model (FeeStructureIntake M2M) — rejected because shared template mutation affects all assigned intakes including those with live ledgers, making the lock logic impossible to enforce cleanly. FK from FeeStructure to Program with nullable Intake override — rejected because it creates a stale program-level fallback that is always overridden in practice.
+**Status:** Implemented
+
+---
+
+## ADR-031: One active fee structure per intake — constraint on `FeeStructure` directly
+**Decision:** The `FeeStructureIntake` junction model has been removed. The one-active-structure-per-intake guarantee is now enforced by a partial unique index directly on `FeeStructure`:
+
+```python
+UniqueConstraint(
+    fields=['organization', 'intake'],
+    condition=Q(intake__isnull=False, is_active=True),
+    name='unique_active_structure_per_intake'
+)
+```
+
+**Reason:** The junction model was introduced to allow M2M (one structure → many intakes), but shared-template mutation on structures with multiple active intake assignments proved dangerous — editing a FeeHead would retroactively affect all assigned intakes including those with live ledgers. Moving to per-intake clones (see ADR-030) eliminates the M2M requirement. The uniqueness guarantee becomes a simple DB constraint on the cloned row itself. Replacing a structure on an intake: `clone_structure_for_intake` soft-deletes the existing active clone (blocked if any `FeeLedger` references it) and creates a new independent clone atomically.
+
 **Status:** Implemented
 
 ---
@@ -502,12 +511,13 @@ class FeeHead(models.Model):
 
 **Resolution logic:**
 ```python
-def resolve_fee_structure(intake):
-    mapping = FeeStructureIntake.objects.filter(
+def _resolve_fee_structure(intake, organization):
+    """Returns the active intake-bound FeeStructure for this intake, or None."""
+    return FeeStructure.objects.filter(
+        organization=organization,
         intake=intake,
-        is_active=True
-    ).select_related('fee_structure').first()
-    return mapping.fee_structure if mapping else None
+        is_active=True,
+    ).first()
 
 # Inside create_enrollment (same transaction.atomic()):
 enrollment = Enrollment(...)
@@ -519,7 +529,7 @@ ledger = FeeLedger.objects.create(
     enrollment=enrollment,
 )
 
-structure = resolve_fee_structure(intake)
+structure = _resolve_fee_structure(enrollment.intake, organization)
 if structure:
     generate_ledger_entries(ledger=ledger, structure=structure)
     assign_default_schedule(ledger=ledger, structure=structure)
@@ -997,4 +1007,4 @@ const locale = navigator.language
 - Frontend uses date_format setting for display only
 - No backend date formatting — purely a frontend hint
 
-**Status:** Planned
+**Status:** Implemented

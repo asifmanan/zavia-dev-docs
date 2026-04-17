@@ -226,6 +226,13 @@ Permission classes used across views:
 - late_fee_type                 CharField, choices=[PERCENTAGE, FIXED], null=True
 - late_fee_value                DecimalField(max_digits=10, decimal_places=2), null=True
 - late_fee_grace_days           PositiveIntegerField, default=0
+- currency_code                 CharField(max_length=3), default='GBP'  ← ISO 4217
+- currency_symbol               CharField(max_length=5), default='£'
+- timezone                      CharField(max_length=50), default='Europe/London'  ← IANA
+- date_format                   CharField(max_length=20), default='DD/MM/YYYY'
+- currency_position             CharField, choices=[PREFIX, SUFFIX], default='PREFIX'
+- decimal_separator             CharField(max_length=1), default='.'
+- thousands_separator           CharField(max_length=1), default=','
 - created_at                    auto
 - updated_at                    auto
 ```
@@ -530,11 +537,13 @@ Organization
   │                          ├── LedgerEntry     (snapshot of fee heads at enrollment time)
   │                          ├── LedgerInstalment (materialised from default schedule)
   │                          └── LedgerTransaction (payments, concessions, additional charges)
-  └── FeeStructure
+  ├── TaxRate (org-scoped, referenced by FeeHead)
+  └── FeeStructure (intake FK, null=template / set=intake-bound)
         ├── FeeHead (line items — name, amount, period_label)
+        │     └── tax_rate FK → TaxRate
         ├── FeeSchedule (instalment templates)
         │     └── ScheduleInstalment (percentage or fixed_amount per instalment)
-        └── FeeStructureIntake ──→ Intake  (junction: one active structure per intake)
+        └── source_template FK → self (clone lineage — null on templates)
 ```
 
 **Key relationship note:** A `Course` is owned by one `Department` (via FK). It can be included in any `Program`'s curriculum via `CurriculumEntry` regardless of which department owns the program. Ownership ≠ usage.
@@ -673,8 +682,7 @@ GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
 POST   /api/v1/orgs/{slug}/fees/structures/{id}/schedules/
 GET    /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
 DELETE /api/v1/orgs/{slug}/fees/structures/{id}/schedules/{id}/
-POST   /api/v1/orgs/{slug}/fees/structures/{id}/assign-intake/
-DELETE /api/v1/orgs/{slug}/fees/structures/{id}/assign-intake/
+POST   /api/v1/orgs/{slug}/fees/structures/{id}/clone/
 
 # Fees — Ledger layer
 GET    /api/v1/orgs/{slug}/fees/ledgers/              ?enrollment=  ?student=  ?has_balance=
@@ -729,13 +737,16 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | 28 | Duration stored as total months (integer) | Eliminates `duration_unit` field from Program model. Frontend decomposes into years + months for display and editing. Simpler comparisons and sorting. |
 | 29 | `fees/` as a separate Django app | Fees are a financially distinct domain with independent lifecycle, reporting, and future payment gateway integration — coupling to `enrollments/` or `students/` would create mixed concerns |
 | 30 | `FeeStructure` is a standalone org-scoped template | No FK to Program or Intake — assigned to intakes via junction model. Allows one structure to be reused across multiple intakes with identical fees without duplication |
-| 31 | `FeeStructureIntake` junction model — one active structure per intake | M2M between FeeStructure and Intake; partial unique constraint ensures at most one active structure assignment per intake at any time |
+| 31 | One active fee structure per intake — constraint on `FeeStructure` directly | `FeeStructureIntake` junction removed; partial unique index on `(organization, intake)` where `intake IS NOT NULL AND is_active` enforces the one-active-structure guarantee directly on the cloned row |
 | 32 | `FeeHead` locked after first `LedgerEntry` references it | Coarser structure-level lock would block legitimate additions (e.g. Semester 2 fees after Semester 1 ledgers exist). Per-head lock at the right granularity; new heads always propagate to existing ledgers in `transaction.atomic()` |
 | 33 | Ledger auto-generated on enrollment; manual bulk endpoint for pre-existing | Empty `FeeLedger` always created even with no fee structure — enrollment is never blocked by fee config. Bulk endpoint (`POST .../intakes/{id}/generate-ledgers/`) handles onboarding migrations; idempotent |
 | 34 | `LedgerEntry` stores snapshot fields — never mutated | `head_name` and `charged_amount` are copied at generation time. Subsequent `FeeHead` edits cannot retroactively change a student's established fee obligation — accounting principle + compliance requirement |
 | 35 | `LedgerTransaction` unifies all post-generation ledger movements | Payments, concessions, additional charges, and reversals are all transaction records distinguished by `transaction_type`. Unified audit trail; balance computed as `total_charged + debits − credits` |
 | 36 | Instalment schedule is a template — materialised per ledger | `FeeSchedule`/`ScheduleInstalment` are structure-level templates. `LedgerInstalment` is the per-student materialised copy. Unpaid instalments recalculate proportionally when concession or additional charge is posted |
 | 37 | Late fee computed on demand; raised as `ADDITIONAL_CHARGE` | Auto-posting via scheduled job is fragile and surprising. Late fee shown as an indicator on overdue instalments; admin raises it explicitly as a transaction. Settings (`late_fee_enabled`, `late_fee_type`, `late_fee_value`, `late_fee_grace_days`) live on `OrganizationSettings` |
+| 38 | `tax/` as a separate Django app | Tax rate configuration is not fees-specific — other domains (invoicing, reporting) will need it. A dedicated app owns the concept cleanly and avoids cross-app imports |
+| 39 | Tax exclusive with stored snapshots on `LedgerEntry` | `charged_amount` is pre-tax net; `tax_amount` and `gross_amount` stored separately. Snapshot of `tax_rate` at generation time ensures historical accuracy even if the rate changes later |
+| 40 | Currency, locale, and timezone on `OrganizationSettings` | Display/formatting concerns only — monetary values stored as plain `DecimalField`. Single-currency per org; storing currency once at org level is the correct separation; avoids MoneyField complexity |
 
 ---
 
@@ -755,6 +766,7 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters |
 | `enrollments/` | ✅ | ✅ | ✅ | Complete |
 | `fees/` | ✅ | ✅ | ✅ | Complete |
+| `tax/` | ✅ | n/a | n/a | Complete — TaxRate model only |
 
 ### Frontend
 
@@ -789,6 +801,7 @@ Core academic back-office for institution administrators.
 - Attendance management
 - Invoicing
 - Reporting
+- Tax reporting (GST/VAT return summaries)
 
 ### Phase 3 — Institution Management
 - Teacher management
