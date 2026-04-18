@@ -505,20 +505,23 @@ Business rules (enforced in use case):
 - Cannot soft-delete an ACTIVE enrollment — must be withdrawn/completed first
 - Cannot delete an intake that has active enrollments
 
+**`IntakePeriod` model** (implemented)
+```
+- id            UUID, PK
+- organization  FK → Organization
+- intake        FK → Intake
+- name          CharField(max_length=100)  — e.g. "Semester 1", "Semester 2"
+- order         PositiveIntegerField, default=0
+- is_active     BooleanField, default=True
+- created_at    auto
+- updated_at    auto
+```
+
+Named, ordered segments of an intake used to group `FeeHead` line items. Org-owned and intake-scoped. Soft-deleted; deletion blocked if any active `FeeHead` references it. `FeeHead.period_label` (free-text CharField) was replaced by a nullable `intake_period` FK to this model.
+
+Constraint: `UniqueConstraint(fields=['intake', 'name'], condition=Q(is_active=True))` — no two active periods can share a name within the same intake.
+
 **Enrollment progression models (planned — Phase 2)**
-
-**`IntakePeriod` model**
-```
-- id                UUID, PK
-- intake            FK → Intake
-- curriculum_level  FK → CurriculumLevel
-- name              CharField (e.g. "Semester 1", "Semester 2")
-- start_date        DateField
-- end_date          DateField
-- status            CharField, choices=[UPCOMING, ACTIVE, COMPLETED]
-```
-
-Represents a time-bound segment of an intake mapped to a specific curriculum level (e.g. Semester 1 maps to Year 1). Enables tracking student progression through levels over time.
 
 **`EnrollmentCourse` model**
 ```
@@ -548,6 +551,7 @@ Organization
   │     │     │     │     └── CurriculumEntry ──→ Course (owned by a dept, borrowed here)
   │     │     │     └── CurriculumEntry (unassigned — curriculum_level=null)
   │     │     └── Intake ──→ CurriculumVersion
+  │     │           └── IntakePeriod (named, ordered fee-period labels)
   │     └── Course (owned by this department)
   ├── Student
   │     └── Enrollment ──→ Program
@@ -558,7 +562,7 @@ Organization
   │                          └── LedgerTransaction (payments, concessions, additional charges)
   ├── TaxRate (org-scoped, referenced by FeeHead)
   └── FeeStructure (intake FK, null=template / set=intake-bound)
-        ├── FeeHead (line items — name, amount, period_label)
+        ├── FeeHead (line items — name, amount, intake_period FK)
         │     └── tax_rate FK → TaxRate
         ├── FeeSchedule (instalment templates)
         │     └── ScheduleInstalment (percentage or fixed_amount per instalment)
@@ -683,6 +687,14 @@ GET    /api/v1/orgs/{slug}/intakes/{id}/
 PATCH  /api/v1/orgs/{slug}/intakes/{id}/
 DELETE /api/v1/orgs/{slug}/intakes/{id}/
 
+# Intake Periods
+GET    /api/v1/orgs/{slug}/intakes/{id}/periods/
+POST   /api/v1/orgs/{slug}/intakes/{id}/periods/
+GET    /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+PATCH  /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+DELETE /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+POST   /api/v1/orgs/{slug}/intakes/{id}/periods/reorder/
+
 # Enrollments
 GET    /api/v1/orgs/{slug}/enrollments/
 POST   /api/v1/orgs/{slug}/enrollments/
@@ -787,6 +799,7 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | 38 | `tax/` as a separate Django app | Tax rate configuration is not fees-specific — other domains (invoicing, reporting) will need it. A dedicated app owns the concept cleanly and avoids cross-app imports |
 | 39 | Tax exclusive with stored snapshots on `LedgerEntry` | `charged_amount` is pre-tax net; `tax_amount` and `gross_amount` stored separately. Snapshot of `tax_rate` at generation time ensures historical accuracy even if the rate changes later |
 | 40 | Currency, locale, and timezone on `OrganizationSettings` | Display/formatting concerns only — monetary values stored as plain `DecimalField`. Single-currency per org; storing currency once at org level is the correct separation; avoids MoneyField complexity |
+| 41 | `IntakePeriod` as named fee-period label; `FeeHead.period_label` removed | Free-text `period_label` on FeeHead caused inconsistency across heads (misspellings, drift). A first-class `IntakePeriod` model enforces consistency and allows reuse across fee heads. `LedgerEntry.period_label` snapshot retained — records `intake_period.name` at generation time. See ADR-046. |
 
 ---
 
@@ -803,7 +816,7 @@ GET    /api/v1/orgs/{slug}/enrollments/{id}/ledger/
 | `courses/` | ✅ | ✅ | ✅ | Complete — `department` FK added |
 | `programs/` | ✅ | ✅ | ✅ | Complete — `department` on_delete tightened to PROTECT |
 | `curriculum/` | ✅ | ✅ | ✅ | Complete |
-| `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters |
+| `intakes/` | ✅ | ✅ | ✅ | Complete — renamed from `academic_terms/`; flat + nested endpoints; search, program, status filters; `IntakePeriod` CRUD + reorder |
 | `enrollments/` | ✅ | ✅ | ✅ | Complete |
 | `fees/` | ✅ | ✅ | ✅ | Complete |
 | `tax/` | ✅ | ✅ | ✅ | Complete — TaxRate CRUD with lock enforcement |

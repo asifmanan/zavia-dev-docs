@@ -339,10 +339,17 @@ class CurriculumLevel(models.Model):
   student, program, and intake. Status lifecycle: ACTIVE → SUSPENDED →
   COMPLETED / WITHDRAWN.
 
-- **Phase 2:** `IntakePeriod` introduced — a scheduled segment of an intake
-  mapped to a CurriculumLevel, with a date range and status (UPCOMING, ACTIVE,
-  COMPLETED). This is the time axis that answers "where is this intake right
-  now in the curriculum?"
+- **Phase 1 (implemented):** `IntakePeriod` as fee-period labels — named, ordered
+  segments of an intake used to group `FeeHead` line items (e.g. "Semester 1",
+  "Semester 2"). No date range, no status, no CurriculumLevel link. See ADR-046
+  for the full design. This is a fees-domain construct, not the academic
+  progression model originally envisioned here.
+
+- **Phase 2:** `IntakePeriod` extended (or a separate model) for academic
+  progression — a scheduled segment of an intake mapped to a CurriculumLevel,
+  with a date range and status (UPCOMING, ACTIVE, COMPLETED). This is the time
+  axis that answers "where is this intake right now in the curriculum?" Still
+  deferred.
 
 - **Phase 2:** `EnrollmentCourse` introduced — records a student's association
   with a specific course within a specific intake period. References Enrollment
@@ -352,15 +359,16 @@ class CurriculumLevel(models.Model):
 **Reasoning:**
 - A student progresses through individual courses, not years — year-level
   progression is derived from course outcomes, not stored directly.
-- `IntakePeriod` bridges the academic calendar (time) and curriculum structure
-  (content). Without it, the system cannot answer which semester an intake is
-  currently on, or which courses a student is actively attending.
+- The academic `IntakePeriod` bridges the academic calendar (time) and
+  curriculum structure (content). Without it, the system cannot answer which
+  semester an intake is currently on, or which courses a student is actively
+  attending.
 - `CurriculumEntry` already carries course + level + order context — 
   EnrollmentCourse references it directly rather than Course, avoiding
   denormalisation.
-- Deferring IntakePeriod and EnrollmentCourse to Phase 2 keeps MVP simple
-  while ensuring the architecture extends cleanly without breaking existing
-  enrollment records.
+- Deferring the academic progression layer to Phase 2 keeps MVP simple while
+  ensuring the architecture extends cleanly without breaking existing enrollment
+  records.
 
 **Answers this model provides (Phase 2):**
 - Which semester is Intake 03 currently on?
@@ -370,8 +378,9 @@ class CurriculumLevel(models.Model):
 
 **Deferred to Phase 3+:** Grade, AttendanceRecord (attach to EnrollmentCourse)
 
-**Status:** Partially implemented — Enrollment (MVP) complete.
-IntakePeriod and EnrollmentCourse deferred to Phase 2.
+**Status:** Partially implemented — Enrollment (MVP) complete. Fee-scoped
+IntakePeriod implemented (ADR-046). Academic progression IntakePeriod and
+EnrollmentCourse deferred to Phase 2.
 
 ---
 
@@ -495,13 +504,12 @@ class FeeHead(models.Model):
     structure       FK → FeeStructure
     name            CharField
     amount          DecimalField(max_digits=10, decimal_places=2)
-    period_label    CharField, null=True, blank=True  # "Semester 1" — display only
+    intake_period   FK → IntakePeriod, null=True, blank=True, on_delete=SET_NULL
     order           PositiveIntegerField
     is_active       BooleanField, default=True
     created_at      auto
     updated_at      auto
 ```
-**Phase 2 note:** period_label will gain a nullable FK to IntakePeriod when that model is introduced. Existing heads with period_label set and intake_period=null remain valid as unassigned charges.
 **Status:** Implemented
 
 ---
@@ -569,7 +577,7 @@ class LedgerEntry(models.Model):
     fee_head        FK → FeeHead, null=True, on_delete=SET_NULL
     head_name       CharField       # snapshot
     charged_amount  DecimalField    # snapshot — never mutated
-    period_label    CharField, null=True  # snapshot of FeeHead.period_label
+    period_label    CharField, null=True  # snapshot of intake_period.name at ledger generation time
     is_taxable      BooleanField, default=False
     tax_rate_snapshot  DecimalField, null=True  # see ADR-039
     tax_amount      DecimalField, default=0.00  # see ADR-039
@@ -1176,5 +1184,51 @@ DELETE /api/v1/orgs/{slug}/enrollments/{id}/delete/   # soft delete
 The main `/{id}/` endpoint is read-only (GET only). There is no general PATCH on enrollment fields — status is the only mutable field post-creation, and it is handled exclusively through `/status/`.
 
 **Reason:** A dedicated `/status/` sub-resource makes the intent explicit, enforces the state machine cleanly, and provides a natural hook for future audit logging and workflow triggers (e.g. triggering a ledger freeze on COMPLETED, or a reinstatement prompt on ACTIVE after SUSPENDED).
+
+**Status:** Implemented
+
+---
+
+## ADR-046: IntakePeriod — named fee-period labels for an intake; replaces FeeHead.period_label
+
+**Decision:** Introduce `IntakePeriod` as a first-class model in the `intakes/` app. Each `IntakePeriod` belongs to a single `Intake` and represents a named, ordered segment (e.g. "Semester 1", "Semester 2") used to group `FeeHead` line items. `FeeHead.period_label` (a free-text `CharField`) is removed and replaced with a nullable `intake_period` FK (`on_delete=SET_NULL`). `LedgerEntry.period_label` (the snapshot field) is retained — it records `intake_period.name` at ledger generation time and is never mutated.
+
+**Model:**
+```
+class IntakePeriod(models.Model):
+    id              UUID, PK
+    organization    FK → Organization, on_delete=PROTECT
+    intake          FK → Intake, on_delete=PROTECT, related_name='periods'
+    name            CharField(max_length=100)
+    order           PositiveIntegerField, default=0
+    is_active       BooleanField, default=True
+    created_at      auto
+    updated_at      auto
+
+    class Meta:
+        ordering = ['order', 'created_at']
+        constraints = [UniqueConstraint(fields=['intake', 'name'], condition=Q(is_active=True), name='unique_active_period_name_per_intake')]
+        indexes = [Index(fields=['intake', 'is_active'])]
+```
+
+**Dependency check:** Soft-deleting an `IntakePeriod` is blocked if any active `FeeHead` references it. Staff must first unassign the period from all active fee heads before the period can be deleted.
+
+**Order management:** `create_intake_period` assigns `order = max_active_order + 1` (not count-based, so soft-deleted periods do not corrupt numbering). A dedicated `POST .../reorder/` endpoint accepts `ordered_ids: list` and bulk-updates orders atomically, validating that all active period IDs are present.
+
+**Snapshot strategy:** When `generate_fee_ledger` builds `LedgerEntry` rows, it resolves `head.intake_period.name` (via `select_related('intake_period')`) and writes it to `LedgerEntry.period_label`. This preserves the display label as it existed at enrollment time regardless of subsequent period renames or deletions.
+
+**FeeHead serializer:** `period_label` field removed; `intake_period_id` (writable UUID, allow_null) and `intake_period_name` (read-only SerializerMethodField) added.
+
+**Clone behaviour:** `clone_structure_for_intake` copies `intake_period_id` from source to destination `FeeHead` rows. The cloned heads reference the same `IntakePeriod` objects (which belong to the source intake — this is intentional and acceptable because `IntakePeriod` is org-scoped, not structure-scoped). If the destination intake has its own periods, staff can reassign the FK after cloning.
+
+**Endpoints:**
+```
+GET    /api/v1/orgs/{slug}/intakes/{id}/periods/
+POST   /api/v1/orgs/{slug}/intakes/{id}/periods/
+GET    /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+PATCH  /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+DELETE /api/v1/orgs/{slug}/intakes/{id}/periods/{id}/
+POST   /api/v1/orgs/{slug}/intakes/{id}/periods/reorder/
+```
 
 **Status:** Implemented
